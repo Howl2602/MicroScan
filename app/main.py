@@ -1,46 +1,28 @@
+import sys
+from pathlib import Path
+
 from fastapi import FastAPI
 import httpx
+
+from discovery.models import Discovery
 
 app = FastAPI()
 
 
 @app.get("/")
 def home():
-    return {
-        "message": "app is running"
-        
-    }
+    return {"message": "app is running"}
 
 
 @app.get("/scan")
-def scan(target: str):
-    
-    try:
-        response = httpx.get(target, timeout=5.0)
-        
-    except httpx.RequestError as exc:
-          
-            return {
-                "target": target,
-                "status": None,
-                "reachable": False,
-                "response_time": None,
-                "error": str(exc)
-                
-            }
+def scan(target: str, num: int = 1000):
+    discovery = Discovery()
+    results = discovery.discover(target, num)
+    return {"results": results}
 
-    try:
-        message = response.json()
-        
-    except Exception:
-        message = response.text
-    
-    
-    return {
-        "target": target, 
-        "status": response.status_code,
-        "reachable": True,
-        "response_time": response.elapsed.total_seconds(),
-        "message": message
-        
-    }
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
