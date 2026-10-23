@@ -1,5 +1,4 @@
-import { useState } from 'react'
-
+import { useMemo, useState } from 'react'
 
 import {
   Box,
@@ -18,9 +17,9 @@ import {
   TableHead,
   TableRow,
   Chip,
+  Alert,
+  CircularProgress,
 } from '@mui/material'
-
-
 
 const drawerWidth = 240
 
@@ -32,7 +31,7 @@ function buildApiTree(results) {
     const parts = path.split('/').filter(Boolean)
 
     let current = root
-    let endpointNode
+    let endpointNode = null
 
     parts.forEach((part) => {
       if (!current[part]) {
@@ -57,16 +56,12 @@ function buildApiTree(results) {
   return root
 }
 
-
-
 function ApiTreeNode({ node, depth = 0 }) {
   return (
     <>
       {Object.entries(node).map(([name, item]) => (
         <Box key={name} sx={{ ml: depth * 2, mt: 1 }}>
-          <Typography
-            sx={{ color: '#38BDF8', fontWeight: 600 }}
-          >
+          <Typography sx={{ color: '#38BDF8', fontWeight: 600 }}>
             📁 /{name}
           </Typography>
 
@@ -85,37 +80,27 @@ function ApiTreeNode({ node, depth = 0 }) {
                   flexWrap: 'wrap',
                 }}
               >
-                <Chip
-                  label={endpoint.method ?? 'UNKNOWN'}
-                  size="small"
-                  color="primary"
-                />
-
+                <Chip label={endpoint.method ?? 'UNKNOWN'} size="small" color="primary" />
                 <Typography variant="body2">
                   {endpoint.path ?? endpoint.target ?? '/'}
                 </Typography>
-
                 <Chip
                   label={status ?? '-'}
                   size="small"
                   variant="outlined"
                   color={
-                    status >= 500
-                      ? 'error'
-                      : status >= 400
-                        ? 'warning'
-                        : 'success'
+                    status >= 500 ? 'error' : status >= 400 ? 'warning' : 'success'
                   }
                 />
+                {endpoint.classification && (
+                  <Chip label={endpoint.classification} size="small" variant="outlined" />
+                )}
               </Box>
             )
           })}
 
           {Object.keys(item.children).length > 0 && (
-            <ApiTreeNode
-              node={item.children}
-              depth={depth + 1}
-            />
+            <ApiTreeNode node={item.children} depth={depth + 1} />
           )}
         </Box>
       ))}
@@ -123,18 +108,192 @@ function ApiTreeNode({ node, depth = 0 }) {
   )
 }
 
+function TestFindings({ findings }) {
+  if (findings.length === 0) {
+    return (
+      <Typography color="text.secondary" sx={{ mt: 2 }}>
+        No automated authentication test results are available for this scan.
+      </Typography>
+    )
+  }
+
+  return findings.map((finding, index) => (
+    <Box key={`${finding.endpoint}-${finding.module}-${index}`} sx={{ mt: 2 }}>
+      <Chip
+        label={finding.status}
+        size="small"
+        color={
+          finding.status === 'potential' || finding.status === 'confirmed'
+            ? 'warning'
+            : finding.status === 'not_vulnerable_in_test'
+              ? 'success'
+              : finding.status === 'error'
+                ? 'error'
+                : 'default'
+        }
+        sx={{ mb: 1 }}
+      />
+      <Typography variant="subtitle2">
+        {finding.module} · {finding.method ?? 'GET'} · {finding.endpoint}
+      </Typography>
+      {finding.tested_endpoint && (
+        <Typography color="text.secondary" variant="body2">
+          Protected endpoint tested: {finding.tested_endpoint}
+        </Typography>
+      )}
+      {finding.endpoint_selection_reason && (
+        <Typography color="text.secondary" variant="body2">
+          Selection: {finding.endpoint_selection_reason}
+        </Typography>
+      )}
+      <Typography color="text.secondary" variant="body2">
+        {finding.reason}
+      </Typography>
+      {finding.discovery && (
+        <Box sx={{ mt: 1 }}>
+          <Typography variant="subtitle2">Discovery</Typography>
+          <Typography color="text.secondary" variant="body2">
+            Authentication mechanism: {finding.authentication_mechanism ?? 'unknown'}
+          </Typography>
+          {finding.discovery.note && (
+            <Typography color="text.secondary" variant="body2">
+              {finding.discovery.note}
+            </Typography>
+          )}
+          {finding.discovery.discovered_login_endpoints?.map((endpoint) => (
+            <Typography
+              key={`${endpoint.method}-${endpoint.path}`}
+              color="text.secondary"
+              variant="body2"
+            >
+              Discovered login candidate: {endpoint.method} {endpoint.path}
+              {endpoint.discovery_status
+                ? ` · discovery HTTP ${endpoint.discovery_status}`
+                : ''}
+            </Typography>
+          ))}
+        </Box>
+      )}
+      {finding.unauthenticated_checks?.length > 0 && (
+        <Box sx={{ mt: 1 }}>
+          <Typography variant="subtitle2">Unauthenticated checks</Typography>
+          <Box
+            component="pre"
+            sx={{
+              mt: 0.5,
+              p: 1.5,
+              borderRadius: 1,
+              backgroundColor: '#0B1120',
+              color: '#CBD5E1',
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere',
+              fontSize: '0.8rem',
+            }}
+          >
+            {JSON.stringify(finding.unauthenticated_checks, null, 2)}
+          </Box>
+        </Box>
+      )}
+      {finding.authenticated_check && (
+        <Box sx={{ mt: 1 }}>
+          <Typography variant="subtitle2">
+            Authenticated check · {finding.authenticated_check.status}
+          </Typography>
+          <Typography color="text.secondary" variant="body2">
+            {finding.authenticated_check.reason}
+          </Typography>
+          {finding.authenticated_check.evidence && (
+            <Box
+              component="pre"
+              sx={{
+                mt: 0.5,
+                p: 1.5,
+                borderRadius: 1,
+                backgroundColor: '#0B1120',
+                color: '#CBD5E1',
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+                fontSize: '0.8rem',
+              }}
+            >
+              {JSON.stringify(finding.authenticated_check.evidence, null, 2)}
+            </Box>
+          )}
+        </Box>
+      )}
+      {finding.evidence?.length > 0 && (
+        <Box
+          component="pre"
+          sx={{
+            mt: 1,
+            p: 1.5,
+            borderRadius: 1,
+            backgroundColor: '#0B1120',
+            color: '#CBD5E1',
+            whiteSpace: 'pre-wrap',
+            overflowWrap: 'anywhere',
+            fontSize: '0.8rem',
+          }}
+        >
+          {JSON.stringify(finding.evidence, null, 2)}
+        </Box>
+      )}
+    </Box>
+  ))
+}
 
 function App() {
-
   const [target, setTarget] = useState('')
   const [scanResults, setScanResults] = useState([])
+  const [findings, setFindings] = useState([])
+  const [summary, setSummary] = useState({})
   const [scanCount, setScanCount] = useState(0)
   const [activePage, setActivePage] = useState('Dashboard')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  const endpointSummary = useMemo(() => {
+    const total = scanResults.length
+    const auth = scanResults.filter((item) => item.classification === 'authentication').length
+    const resource = scanResults.filter((item) => item.classification === 'resource_by_id' || item.classification === 'resource_collection').length
+    return { total, auth, resource }
+  }, [scanResults])
+
+  const runScan = async () => {
+    if (!target.trim()) {
+      setError('Enter a valid target such as localhost:8085 or https://example.com.')
+      return
+    }
+
+    setLoading(true)
+    setError('')
+
+    try {
+      const response = await fetch(
+        `http://localhost:8000/scan?target=${encodeURIComponent(target.trim())}&num=200`
+      )
+
+      const payload = await response.json()
+      if (!response.ok) {
+        throw new Error(payload?.detail || `HTTP ${response.status}`)
+      }
+
+      setScanResults(payload.results ?? [])
+      setFindings(payload.findings ?? [])
+      setSummary(payload.summary ?? {})
+      setScanCount((count) => count + 1)
+      setActivePage('Reports')
+    } catch (caughtError) {
+      setError(caughtError.message || 'The scan could not be completed.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const totalPotentialFindings = findings.filter((item) => item.status === 'potential').length
 
   return (
     <Box sx={{ display: 'flex', minHeight: '100vh' }}>
-
-      {/* Sidebar                  */}
       <Drawer
         variant="permanent"
         sx={{
@@ -147,16 +306,8 @@ function App() {
           },
         }}
       >
-
         <Toolbar>
-          <Typography
-            variant="h6"
-            sx={{
-              fontWeight: 700,
-              color: 'primary.main',
-              letterSpacing: 1,
-            }}
-          >
+          <Typography variant="h6" sx={{ fontWeight: 700, color: 'primary.main', letterSpacing: 1 }}>
             ◈ MICROSCAN
           </Typography>
         </Toolbar>
@@ -186,8 +337,6 @@ function App() {
         </List>
       </Drawer>
 
-
-      {/* Main content                */}
       <Box
         component="main"
         sx={{
@@ -198,10 +347,7 @@ function App() {
           color: 'text.primary',
         }}
       >
-        <Typography
-          variant="h4"
-          sx={{ fontWeight: 700, mb: 1, color: '#E5E7EB' }}
-        >
+        <Typography variant="h4" sx={{ fontWeight: 700, mb: 1, color: '#E5E7EB' }}>
           {activePage === 'Dashboard' && 'Security Dashboard'}
           {activePage === 'Scan' && 'Endpoint Discovery'}
           {activePage === 'API Map' && 'API Endpoint Map'}
@@ -217,7 +363,12 @@ function App() {
           {activePage === 'Settings' && 'Configure your scanner'}
         </Typography>
 
-        {/* DASHBOARD */}
+        {error && (
+          <Alert severity="error" sx={{ mb: 3 }}>
+            {error}
+          </Alert>
+        )}
+
         {activePage === 'Dashboard' && (
           <>
             <Box sx={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
@@ -225,16 +376,16 @@ function App() {
                 <CardContent>
                   <Typography color="text.secondary">Endpoints</Typography>
                   <Typography variant="h3" sx={{ mt: 1, fontWeight: 700 }}>
-                    {scanResults.length}
+                    {endpointSummary.total}
                   </Typography>
                 </CardContent>
               </Card>
 
               <Card sx={{ flex: '1 1 180px' }}>
                 <CardContent>
-                  <Typography color="text.secondary">Vulnerabilities</Typography>
+                  <Typography color="text.secondary">Potential findings</Typography>
                   <Typography variant="h3" sx={{ mt: 1, fontWeight: 700 }}>
-                    0
+                    {totalPotentialFindings}
                   </Typography>
                 </CardContent>
               </Card>
@@ -252,17 +403,16 @@ function App() {
             <Card sx={{ mt: 4 }}>
               <CardContent>
                 <Typography variant="h6" sx={{ mb: 1 }}>
-                  Welcome to MicroScan
+                  Discovery summary
                 </Typography>
                 <Typography color="text.secondary">
-                  Use the Scan page to discover endpoints in your target application.
+                  {endpointSummary.auth} authentication endpoints, {endpointSummary.resource} resource endpoints, and {scanResults.length} total endpoints discovered.
                 </Typography>
               </CardContent>
             </Card>
           </>
         )}
 
-        {/* SCAN       */}
         {activePage === 'Scan' && (
           <>
             <Typography variant="h6" sx={{ mb: 2 }}>
@@ -290,38 +440,24 @@ function App() {
 
               <Box
                 component="button"
-                onClick={async () => {
-                  if (!target.trim()) return
-
-                  try {
-                    const response = await fetch(
-                      `http://localhost:8000/scan?target=${encodeURIComponent(target.trim())}`
-                    )
-
-                    if (!response.ok) {
-                      throw new Error(`HTTP ${response.status}`)
-                    }
-
-                    const data = await response.json()
-                    setScanResults(data.results ?? [])
-                    setScanCount((count) => count + 1)
-                  } catch (error) {
-                    console.error('Scan failed:', error)
-                    alert('Scan failed. Check that the backend is running.')
-                  }
-                }}
+                disabled={loading}
+                onClick={runScan}
                 sx={{
                   px: 3,
                   py: 1.5,
                   border: 'none',
                   borderRadius: 1,
-                  backgroundColor: 'primary.main',
+                  backgroundColor: loading ? '#475569' : 'primary.main',
                   color: '#0B1120',
                   fontWeight: 700,
-                  cursor: 'pointer',
+                  cursor: loading ? 'default' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 1,
                 }}
               >
-                START SCAN
+                {loading && <CircularProgress size={16} color="inherit" />}
+                {loading ? 'SCANNING...' : 'START SCAN'}
               </Box>
             </Box>
 
@@ -336,6 +472,7 @@ function App() {
                     <TableRow>
                       <TableCell>Method</TableCell>
                       <TableCell>Endpoint</TableCell>
+                      <TableCell>Class</TableCell>
                       <TableCell>Status</TableCell>
                     </TableRow>
                   </TableHead>
@@ -343,28 +480,24 @@ function App() {
                   <TableBody>
                     {scanResults.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={3} align="center">
+                        <TableCell colSpan={4} align="center">
                           No results yet. Enter a target and start a scan.
                         </TableCell>
                       </TableRow>
                     ) : (
                       scanResults.map((result, index) => {
                         const status = result.responses?.[0]?.sc
-
                         return (
                           <TableRow key={`${result.method}-${result.path}-${index}`}>
                             <TableCell>{result.method ?? '-'}</TableCell>
                             <TableCell>{result.path ?? result.target ?? '-'}</TableCell>
+                            <TableCell>{result.classification ?? 'unknown'}</TableCell>
                             <TableCell>
                               <Chip
                                 label={status ?? '-'}
                                 size="small"
                                 color={
-                                  status >= 500
-                                    ? 'error'
-                                    : status >= 400
-                                      ? 'warning'
-                                      : 'success'
+                                  status >= 500 ? 'error' : status >= 400 ? 'warning' : 'success'
                                 }
                               />
                             </TableCell>
@@ -380,16 +513,12 @@ function App() {
             <Card sx={{ mt: 4 }}>
               <CardContent>
                 <Typography variant="h6">Pentest Analysis</Typography>
-                <Chip label="COMING SOON" color="warning" size="small" sx={{ my: 2 }} />
-                <Typography color="text.secondary">
-                  Vulnerability testing modules will appear here when implemented.
-                </Typography>
+                <TestFindings findings={findings} />
               </CardContent>
             </Card>
           </>
         )}
 
-        {/* API MAP */}
         {activePage === 'API Map' && (
           <Card>
             <CardContent>
@@ -412,7 +541,6 @@ function App() {
           </Card>
         )}
 
-        {/* REPORTS */}
         {activePage === 'Reports' && (
           <Card>
             <CardContent>
@@ -432,19 +560,30 @@ function App() {
                   <Typography sx={{ mb: 2 }}>
                     Latest target: {target || 'Not specified'}
                   </Typography>
-                  <Typography sx={{ mb: 2 }}>
-                    Endpoints discovered: {scanResults.length}
+                  <Typography sx={{ mb: 1 }}>
+                    Endpoints discovered: {summary.total_endpoints ?? scanResults.length}
+                  </Typography>
+                  <Typography sx={{ mb: 1 }}>
+                    Authentication endpoints: {summary.auth_endpoints ?? 0}
+                  </Typography>
+                  <Typography sx={{ mb: 1 }}>
+                    Potential findings: {summary.potential_findings ?? totalPotentialFindings}
                   </Typography>
                   <Typography color="text.secondary" variant="body2">
-                    ######
+                    {findings.length === 0
+                      ? 'No test evidence captured yet.'
+                      : 'Evidence captured from the active scan.'}
                   </Typography>
+                  <Typography variant="h6" sx={{ mt: 3 }}>
+                    Authentication test evidence
+                  </Typography>
+                  <TestFindings findings={findings} />
                 </>
               )}
             </CardContent>
           </Card>
         )}
 
-        {/* SETTINGS */}
         {activePage === 'Settings' && (
           <Card>
             <CardContent>
@@ -452,7 +591,7 @@ function App() {
                 Scanner Configuration
               </Typography>
               <Typography color="text.secondary" sx={{ mb: 3 }}>
-                Settings UI preview. These controls do not change backend behavior yet.
+                Restrict the target to an authorized host, and discover endpoints using Kiterunner.
               </Typography>
 
               <Typography sx={{ mb: 1 }}>Default target</Typography>
@@ -479,15 +618,12 @@ function App() {
               <Chip label="Kiterunner" color="primary" variant="outlined" />
 
               <Typography sx={{ mt: 3 }} color="text.secondary" variant="body2">
-                Dictionary size, timeout and concurrency settings can be connected
-                after the backend supports them.
+                The backend validates the target URL and rejects malformed or out-of-scope requests.
               </Typography>
             </CardContent>
           </Card>
         )}
       </Box>
-
-
     </Box>
   )
 }
