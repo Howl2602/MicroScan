@@ -113,14 +113,27 @@ class EndpointSelector:
 
     @staticmethod
     def discovery_status(endpoint):
+        for key in ("status", "status_code", "sc"):
+            status = endpoint.get(key)
+            if isinstance(status, int):
+                return status
+            if isinstance(status, str) and status.isdigit():
+                return int(status)
+
         responses = endpoint.get("responses")
         if not isinstance(responses, list):
             return None
         for response in responses:
             if isinstance(response, dict):
-                status = response.get("sc") or response.get("status_code")
+                status = (
+                    response.get("sc")
+                    or response.get("status_code")
+                    or response.get("status")
+                )
                 if isinstance(status, int):
                     return status
+                if isinstance(status, str) and status.isdigit():
+                    return int(status)
         return None
 
     @classmethod

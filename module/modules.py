@@ -1,10 +1,18 @@
+import ipaddress
+import json
 import os
+import re
+from urllib.parse import urlsplit
 
 from module.authentication_test import AuthenticationTest
 from module.endpoint_selection import EndpointSelector
+from module.signin import LoginConfigurationError, Signin
 
 
 _UNSELECTED = object()
+_READ_ONLY_METHODS = {"GET"}
+_MAX_AUTOMATIC_JWT_ENDPOINTS = 5
+_MAX_CONFIGURED_JWT_ENDPOINTS = 100
 
 
 class Modules:
@@ -26,6 +34,255 @@ class Modules:
             override_path=protected_path or None,
         )
 
+    @staticmethod
+    def _endpoint_allowlist():
+        Signin.load_environment()
+        raw = os.environ.get("MICROSCAN_JWT_ENDPOINT_ALLOWLIST", "").strip()
+        allowlist = []
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "MICROSCAN_JWT_ENDPOINT_ALLOWLIST must be a JSON array."
+                ) from exc
+            if not isinstance(parsed, list):
+                raise ValueError(
+                    "MICROSCAN_JWT_ENDPOINT_ALLOWLIST must be a JSON array."
+                )
+            for item in parsed:
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        "Each JWT endpoint allowlist entry must contain method and path."
+                    )
+                method = item.get("method")
+                path = item.get("path")
+                if not isinstance(method, str) or not isinstance(path, str):
+                    raise ValueError(
+                        "Each JWT endpoint allowlist entry must contain method and path."
+                    )
+                path_parts = urlsplit(path)
+                if (
+                    not re.fullmatch(r"[A-Za-z]+", method.strip())
+                    or any(character.isspace() for character in path)
+                    or not path.startswith("/")
+                    or path_parts.scheme
+                    or path_parts.netloc
+                    or path_parts.query
+                    or path_parts.fragment
+                ):
+                    raise ValueError(
+                        "JWT endpoint allowlist paths must be origin-relative paths "
+                        "without query or fragment data."
+                    )
+                allowlist.append((method.strip().upper(), path))
+
+        legacy_path = os.environ.get("MICROSCAN_PROTECTED_ENDPOINT", "").strip()
+        if legacy_path:
+            allowlist.append(("GET", legacy_path))
+
+        return list(dict.fromkeys(allowlist))
+
+    @staticmethod
+    def _is_local_target(target):
+        try:
+            hostname = urlsplit(Signin.normalize_target(target)).hostname
+            if hostname is None:
+                return False
+            if hostname.lower() == "localhost":
+                return True
+            return ipaddress.ip_address(hostname).is_loopback
+        except (LoginConfigurationError, ValueError):
+            return False
+
+    @staticmethod
+    def _discovered_path(endpoint, target):
+        raw_path = endpoint.get("path") or endpoint.get("target")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None, "Discovery did not provide an endpoint path."
+
+        raw_path = raw_path.strip()
+        try:
+            parsed = urlsplit(raw_path)
+        except ValueError:
+            return None, "Discovered endpoint path is invalid."
+        if parsed.scheme or parsed.netloc:
+            if parsed.query or parsed.fragment:
+                return None, "Discovered endpoint URL contains query or fragment data."
+            try:
+                discovered_origin = Signin.normalize_target(
+                    f"{parsed.scheme}://{parsed.netloc}"
+                )
+                if discovered_origin != Signin.normalize_target(target):
+                    return None, "Discovered endpoint URL is outside the configured target origin."
+            except LoginConfigurationError:
+                return None, "Discovered endpoint URL is invalid."
+            raw_path = parsed.path or "/"
+            parsed = urlsplit(raw_path)
+        if parsed.query or parsed.fragment:
+            return None, "Discovered endpoint path contains query or fragment data."
+        if not raw_path.startswith("/"):
+            raw_path = f"/{raw_path}"
+        return raw_path, None
+
+    def _automatic_candidate_reason(self, endpoint):
+        method = str(endpoint.get("method") or "").upper()
+        path = endpoint.get("path") or ""
+        if method != "GET":
+            return None
+        segments = [
+            segment.lower()
+            for segment in path.strip("/").split("/")
+            if segment
+        ]
+        if self.endpoint_selector.is_authentication_path(path):
+            return None
+        if any(
+            segment in {"debug", "health", "metrics", "status"}
+            for segment in segments
+        ):
+            return None
+
+        if not segments:
+            return None
+        protected_terms = {
+            "account",
+            "admin",
+            "billing",
+            "customer",
+            "data",
+            "inventory",
+            "invoice",
+            "item",
+            "member",
+            "order",
+            "payment",
+            "product",
+            "profile",
+            "project",
+            "record",
+            "tenant",
+            "user",
+        }
+        path_tokens = {
+            token
+            for segment in segments
+            for token in re.split(r"[-_]", segment)
+        }
+        protected_resource = any(
+            token in protected_terms
+            or (token.endswith("s") and token[:-1] in protected_terms)
+            for token in path_tokens
+        )
+        classification = endpoint.get("classification") or self.endpoint_selector.classify_endpoint(
+            endpoint
+        )["classification"]
+        protected_resource = protected_resource or classification in {
+            "administrative",
+            "resource_by_id",
+            "resource_collection",
+            "user_or_account",
+        }
+        if not protected_resource:
+            return None
+
+        status = self.endpoint_selector.discovery_status(endpoint)
+        if status == 200:
+            return (
+                "Discovery observed HTTP 200 for a protected-resource candidate; "
+                "selected for an independent JWT check, not treated as a finding."
+            )
+        if status in {401, 403}:
+            return (
+                f"Discovery observed HTTP {status} for a protected-resource candidate; "
+                "selected for an independent JWT check."
+            )
+        return (
+            "Discovery path/type indicates a protected-resource candidate; "
+            "Discovery status is only a selection signal."
+        )
+
+    @staticmethod
+    def _automatic_endpoint_budget():
+        raw = os.environ.get("MICROSCAN_JWT_ENDPOINT_BUDGET", "").strip()
+        if not raw:
+            return _MAX_AUTOMATIC_JWT_ENDPOINTS
+        try:
+            budget = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "MICROSCAN_JWT_ENDPOINT_BUDGET must be an integer between 1 and 100."
+            ) from exc
+        if not 1 <= budget <= _MAX_CONFIGURED_JWT_ENDPOINTS:
+            raise ValueError(
+                "MICROSCAN_JWT_ENDPOINT_BUDGET must be an integer between 1 and 100."
+            )
+        return budget
+
+    @staticmethod
+    def _automatic_route_group(path):
+        segments = path.split("/")
+        grouped_segments = []
+        resource_segments = EndpointSelector.RESOURCE_COLLECTIONS | {
+            "admin",
+            "billing",
+            "customer",
+            "customers",
+            "inventory",
+            "inventories",
+            "invoice",
+            "invoices",
+            "member",
+            "members",
+            "payment",
+            "payments",
+            "profile",
+            "record",
+            "records",
+            "tenant",
+            "tenants",
+        }
+        for index, segment in enumerate(segments):
+            previous_segment = segments[index - 1].lower() if index else ""
+            is_resource_identifier = previous_segment in resource_segments
+            if (
+                is_resource_identifier
+                and (
+                    segment.isdigit()
+                    or re.fullmatch(
+                        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                        r"[0-9a-f]{4}-[0-9a-f]{12}",
+                        segment,
+                        re.IGNORECASE,
+                    )
+                    or re.fullmatch(r"\{[^/]+\}", segment)
+                )
+            ):
+                grouped_segments.append("{id}")
+            else:
+                grouped_segments.append(segment)
+
+        grouped_path = "/".join(grouped_segments)
+        if path.endswith("/") and not grouped_path.endswith("/"):
+            grouped_path += "/"
+        return grouped_path
+
+    @staticmethod
+    def _automatic_endpoint_priority(endpoint, discovery_index):
+        status = EndpointSelector.discovery_status(endpoint)
+        path = str(endpoint.get("path") or "").lower()
+        tokens = set(re.split(r"[-_/]+", path))
+        protected_probe = (
+            bool(tokens & {"order", "orders"}) and "check" in tokens
+        ) or ("admin" in tokens and "dashboard" in tokens)
+        administrative = bool(tokens & {"admin", "administrator"})
+        return (
+            0 if protected_probe else 1 if administrative else 2,
+            0 if status == 200 else 1 if status in {401, 403} else 2,
+            0 if not re.search(r"/\{[^/]+\}", path) else 1,
+            discovery_index,
+        )
+
     def evaluate_authentication_test(
         self,
         target,
@@ -33,19 +290,55 @@ class Modules:
         selected_candidate=_UNSELECTED,
     ):
         if selected_candidate is _UNSELECTED:
-            selected_candidate = self.select_authentication_candidate(
-                discovered_endpoints
-            )
+            allowlist = self._endpoint_allowlist()
+            selected_candidate = None
+            for method, path in allowlist:
+                if method not in _READ_ONLY_METHODS:
+                    continue
+                endpoint = next(
+                    (
+                        item
+                        for item in discovered_endpoints or []
+                        if isinstance(item, dict)
+                        and str(item.get("method") or "").upper() == method
+                        and (item.get("path") or item.get("target")) == path
+                    ),
+                    None,
+                )
+                selected_candidate = {
+                    "endpoint": endpoint,
+                    "path": path,
+                    "method": method,
+                    "reason": "endpoint explicitly included in JWT endpoint allowlist",
+                }
+                break
         return self.authentication_test.evaluate(
             target,
             selected_candidate,
             discovered_endpoints,
         )
 
-    def analyze_endpoints(self, target, results):
+    def analyze_endpoints(self, target, results, auto_jwt_local_lab=False):
         analyzed = []
-        authentication_endpoint = None
+        seen = set()
         for endpoint in results:
+            if not isinstance(endpoint, dict):
+                continue
+            method = str(endpoint.get("method") or "").upper()
+            path, path_error = self._discovered_path(endpoint, target)
+            if path is None:
+                path = endpoint.get("path") or endpoint.get("target") or "/"
+                if not isinstance(path, str):
+                    path = "/"
+            identity = (method, path)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            endpoint["method"] = method or None
+            endpoint["path"] = path
+            endpoint["jwt_path_error"] = path_error
+            endpoint["discovery_source"] = "discovery"
+            endpoint["discovered"] = True
             classification = self.endpoint_selector.classify_endpoint(endpoint)
             endpoint.update(
                 {
@@ -55,30 +348,204 @@ class Modules:
                     "test_results": [],
                 }
             )
-            if (
-                self.TEST_MODULE in classification["applicable_tests"]
-                and authentication_endpoint is None
-            ):
-                authentication_endpoint = endpoint
             analyzed.append(endpoint)
 
-        selected_candidate = self.select_authentication_candidate(analyzed)
-        if selected_candidate and selected_candidate["endpoint"] is not None:
-            authentication_endpoint = selected_candidate["endpoint"]
-            authentication_endpoint["applicable_tests"] = list(
-                dict.fromkeys(
-                    authentication_endpoint["applicable_tests"] + [self.TEST_MODULE]
+        allowlist = self._endpoint_allowlist()
+        allowlist_set = set(allowlist)
+        endpoints_by_identity = {
+            (endpoint.get("method") or "", endpoint.get("path")): endpoint
+            for endpoint in analyzed
+        }
+        for method, path in allowlist:
+            identity = (method, path)
+            if identity not in endpoints_by_identity:
+                analyzed.append(
+                    {
+                        "method": method,
+                        "path": path,
+                        "responses": [],
+                        "discovery_source": "configured_allowlist",
+                        "discovered": False,
+                        "classification": self.endpoint_selector.classify_endpoint(
+                            {"method": method, "path": path}
+                        )["classification"],
+                        "classification_reason": "endpoint explicitly configured in JWT allowlist",
+                        "applicable_tests": [],
+                        "test_results": [],
+                    }
                 )
-            )
-        elif selected_candidate is not None and analyzed and authentication_endpoint is None:
-            authentication_endpoint = analyzed[0]
 
-        if authentication_endpoint is not None:
-            authentication_endpoint["test_results"].append(
-                self.evaluate_authentication_test(
+        auto_mode_reason = None
+        selected_reasons = {}
+        automatic_skip_reasons = {}
+        if allowlist:
+            selection_mode = "explicit_allowlist"
+            selected_reasons = {
+                identity: "Endpoint explicitly included in JWT endpoint allowlist."
+                for identity in allowlist_set
+                if identity in endpoints_by_identity
+            }
+        elif auto_jwt_local_lab and self._is_local_target(target):
+            selection_mode = "automatic_local_lab"
+            candidates_by_group = {}
+            for discovery_index, endpoint in enumerate(analyzed):
+                if endpoint.get("discovery_source") != "discovery":
+                    continue
+                identity = (endpoint.get("method") or "", endpoint.get("path"))
+                reason = self._automatic_candidate_reason(endpoint)
+                if reason:
+                    group = (identity[0], self._automatic_route_group(identity[1]))
+                    candidates_by_group.setdefault(group, []).append(
+                        (discovery_index, endpoint, identity, reason)
+                    )
+
+            representatives = []
+            for group, candidates in candidates_by_group.items():
+                representative = min(
+                    candidates,
+                    key=lambda candidate: self._automatic_endpoint_priority(
+                        candidate[1], candidate[0]
+                    ),
+                )
+                representatives.append((group, representative))
+
+            endpoint_budget = self._automatic_endpoint_budget()
+            selected_groups = {
+                group
+                for group, _ in sorted(
+                    representatives,
+                    key=lambda item: self._automatic_endpoint_priority(
+                        item[1][1], item[1][0]
+                    ),
+                )[:endpoint_budget]
+            }
+            representative_by_group = {
+                group: candidate for group, candidate in representatives
+            }
+            for group, candidates in candidates_by_group.items():
+                representative = representative_by_group[group]
+                representative_identity = representative[2]
+                if group in selected_groups:
+                    selected_reasons[representative_identity] = representative[3]
+                    for _, _, identity, _ in candidates:
+                        if identity != representative_identity:
+                            automatic_skip_reasons[identity] = (
+                                f"Grouped with representative GET {representative_identity[1]} "
+                                "because it has the same route shape; this endpoint was not "
+                                "tested and its result is not inferred."
+                            )
+                else:
+                    for _, _, identity, _ in candidates:
+                        automatic_skip_reasons[identity] = (
+                            f"Automatic selection is limited to "
+                            f"{endpoint_budget} endpoint groups per scan; "
+                            "higher-priority candidates were selected first."
+                        )
+        elif auto_jwt_local_lab:
+            selection_mode = "blocked_non_local_target"
+            auto_mode_reason = (
+                "Automatic JWT testing is restricted to loopback targets "
+                "(localhost, 127.0.0.0/8, or ::1)."
+            )
+        else:
+            selection_mode = "not_confirmed"
+            auto_mode_reason = (
+                "Automatic JWT selection is disabled for this scan; configure an explicit "
+                "endpoint allowlist to test specific discovered endpoints."
+            )
+
+        self.authentication_test.reset_scan_state()
+        try:
+            for endpoint in analyzed:
+                identity = (endpoint.get("method") or "", endpoint.get("path"))
+                is_allowlisted = identity in allowlist_set
+                endpoint["jwt_allowlisted"] = is_allowlisted
+                endpoint["jwt_selection_mode"] = selection_mode
+                reason = selected_reasons.get(identity)
+                if endpoint.get("discovery_source") == "configured_allowlist":
+                    endpoint["jwt_selected"] = False
+                    endpoint["jwt_selection_reason"] = (
+                        "Allowlisted endpoint was not present in this scan's Discovery results."
+                    )
+                    endpoint["test_results"].append(
+                        self.authentication_test.skipped_result(
+                            endpoint, endpoint["jwt_selection_reason"]
+                        )
+                    )
+                    continue
+                if endpoint.get("jwt_path_error"):
+                    endpoint["jwt_selected"] = False
+                    endpoint["jwt_selection_reason"] = endpoint["jwt_path_error"]
+                    endpoint["test_results"].append(
+                        self.authentication_test.skipped_result(
+                            endpoint, endpoint["jwt_selection_reason"]
+                        )
+                    )
+                    continue
+                if not reason:
+                    if allowlist:
+                        skip_reason = (
+                            "Endpoint was discovered but is not explicitly included in "
+                            "MICROSCAN_JWT_ENDPOINT_ALLOWLIST."
+                        )
+                    elif identity in automatic_skip_reasons:
+                        skip_reason = automatic_skip_reasons[identity]
+                    elif (endpoint.get("method") or "") not in _READ_ONLY_METHODS:
+                        skip_reason = (
+                            f"{endpoint.get('method') or 'Unknown'} is not enabled for JWT "
+                            "testing; only GET is supported."
+                        )
+                    elif auto_mode_reason:
+                        skip_reason = auto_mode_reason
+                    elif self.endpoint_selector.is_authentication_path(identity[1]):
+                        skip_reason = (
+                            "Authentication, login, and registration routes are excluded from "
+                            "the JWT protected-resource matrix."
+                        )
+                    else:
+                        skip_reason = (
+                            "Discovery did not identify a protected-resource candidate or a "
+                            "401/403 response."
+                        )
+                    endpoint["jwt_selected"] = False
+                    endpoint["jwt_selection_reason"] = skip_reason
+                    endpoint["test_results"].append(
+                        self.authentication_test.skipped_result(
+                            endpoint, skip_reason
+                        )
+                    )
+                    continue
+
+                if identity[0] not in _READ_ONLY_METHODS:
+                    endpoint["jwt_selected"] = False
+                    endpoint["jwt_selection_reason"] = (
+                        f"{identity[0] or 'Unknown'} is not enabled for JWT testing; "
+                        "only GET is supported."
+                    )
+                    endpoint["test_results"].append(
+                        self.authentication_test.skipped_result(
+                            endpoint, endpoint["jwt_selection_reason"]
+                        )
+                    )
+                    continue
+
+                endpoint["jwt_selected"] = True
+                endpoint["jwt_selection_reason"] = reason
+                endpoint["applicable_tests"] = list(
+                    dict.fromkeys(endpoint["applicable_tests"] + [self.TEST_MODULE])
+                )
+                candidate = {
+                    "endpoint": endpoint,
+                    "path": endpoint["path"],
+                    "method": identity[0],
+                    "reason": reason,
+                }
+                result = self.evaluate_authentication_test(
                     target,
                     analyzed,
-                    selected_candidate=selected_candidate,
+                    selected_candidate=candidate,
                 )
-            )
+                endpoint["test_results"].append(result)
+        finally:
+            self.authentication_test.reset_scan_state()
         return analyzed

@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import time
 
 from app.logging_config import logger
 from discovery.models import Discovery
 from module.modules import Modules
+from module.pentest_report import build_pentest_report
 from module.signin import LoginConfigurationError, Signin
 
 app = FastAPI(title="MicroScan API", version="1.0.0")
@@ -58,62 +60,103 @@ def home():
 
 
 @app.get("/scan")
-def scan(target: str, num: int = 1000):
+def scan(target: str, num: int = 1000, auto_jwt_local_lab: bool = False):
     normalized_target = validate_target(target)
     logger.info("Scan started | target=%s | dictionary_size=%d", normalized_target, num)
 
     try:
         discovery = Discovery()
         endpoints = discovery.discover(normalized_target, num)
-        analyzed = Modules().analyze_endpoints(normalized_target, endpoints)
+        analyzed = Modules().analyze_endpoints(
+            normalized_target,
+            endpoints,
+            auto_jwt_local_lab=auto_jwt_local_lab,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (FileNotFoundError, RuntimeError, TimeoutError) as exc:
         logger.exception("Scan failed | target=%s | error=%s", normalized_target, str(exc))
-        raise HTTPException(status_code=424, detail=str(exc)) from exc
+        report = build_pentest_report(
+            scan_failed=True,
+            failure_reason="Discovery or scan execution failed before evidence collection.",
+        )
+        return JSONResponse(
+            status_code=424,
+            content={
+                "detail": str(exc),
+                "target": normalized_target,
+                "summary": report["summary"],
+                "findings": report["findings"],
+                "test_results": report["test_results"],
+                "endpoint_assessments": report["endpoint_assessments"],
+            },
+        )
 
-    findings = []
-    for endpoint in analyzed:
-        for result in endpoint.get("test_results", []) or []:
-            if result.get("status") in {
-                "confirmed",
-                "potential",
-                "not_vulnerable_in_test",
-                "inconclusive",
-                "skipped",
-                "error",
-            }:
-                findings.append({
-                    "endpoint": endpoint.get("path") or endpoint.get("target") or "/",
+    report = build_pentest_report(analyzed)
+    summary = report["summary"]
+    discovered_count = summary["discovered_endpoints"]
+    allowlist_targets = sorted(
+        {
+            (endpoint.get("method"), endpoint.get("path"))
+            for endpoint in analyzed
+            if endpoint.get("jwt_allowlisted")
+        }
+    )
+    summary.update(
+        {
+            "total_endpoints": discovered_count,
+            "selected_endpoints": sum(
+                1 for endpoint in analyzed if endpoint.get("jwt_selected")
+            ),
+            "skipped_endpoints": sum(
+                1
+                for endpoint in analyzed
+                if endpoint.get("discovery_source") == "discovery"
+                and not endpoint.get("jwt_selected")
+            ),
+            "skipped_endpoint_reasons": [
+                {
                     "method": endpoint.get("method"),
-                    "module": result.get("test_module"),
-                    "status": result.get("status"),
-                    "reason": result.get("reason"),
-                    "tested_endpoint": result.get("tested_endpoint"),
-                    "endpoint_selection_reason": result.get("endpoint_selection_reason"),
-                    "discovery": result.get("discovery"),
-                    "unauthenticated_checks": result.get("unauthenticated_checks", []),
-                    "authenticated_check": result.get("authenticated_check"),
-                    "authentication_mechanism": result.get("authentication_mechanism", "unknown"),
-                    "evidence": result.get("evidence", []),
-                })
+                    "path": endpoint.get("path"),
+                    "reason": endpoint.get("jwt_selection_reason"),
+                }
+                for endpoint in analyzed
+                if endpoint.get("discovery_source") == "discovery"
+                and not endpoint.get("jwt_selected")
+            ],
+            "total_test_targets": len(analyzed),
+            "jwt_allowlist_configured": bool(allowlist_targets),
+            "jwt_selection_mode": next(
+                (
+                    endpoint.get("jwt_selection_mode")
+                    for endpoint in analyzed
+                    if endpoint.get("jwt_selection_mode")
+                ),
+                "not_confirmed",
+            ),
+            "jwt_allowlist_entries": len(allowlist_targets),
+            "jwt_allowlist_targets": [
+                {"method": method, "path": path}
+                for method, path in allowlist_targets
+            ],
+            "not_vulnerable": summary["not_detected_test_cases"],
+            "auth_endpoints": sum(
+                1
+                for endpoint in analyzed
+                if endpoint.get("discovery_source") == "discovery"
+                and endpoint.get("classification") == "authentication"
+            ),
+        }
+    )
 
-    summary = {
-        "total_endpoints": len(analyzed),
-        "auth_endpoints": sum(1 for endpoint in analyzed if endpoint.get("classification") == "authentication"),
-        "potential_findings": sum(1 for item in findings if item["status"] == "potential"),
-        "not_vulnerable": sum(1 for item in findings if item["status"] == "not_vulnerable_in_test"),
-        "skipped_tests": sum(1 for item in findings if item["status"] == "skipped"),
-        "inconclusive_tests": sum(1 for item in findings if item["status"] == "inconclusive"),
-        "error_tests": sum(1 for item in findings if item["status"] == "error"),
-    }
-
-    logger.info("Scan completed | target=%s | endpoints_found=%d", normalized_target, len(analyzed))
+    logger.info("Scan completed | target=%s | endpoints_found=%d", normalized_target, discovered_count)
     return {
         "target": normalized_target,
         "results": analyzed,
         "summary": summary,
-        "findings": findings,
+        "findings": report["findings"],
+        "test_results": report["test_results"],
+        "endpoint_assessments": report["endpoint_assessments"],
     }
 
 
