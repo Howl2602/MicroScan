@@ -1,5 +1,6 @@
 import unittest
 import os
+import threading
 from unittest.mock import patch
 
 import httpx
@@ -868,6 +869,7 @@ class BolaAnalyzerTests(unittest.TestCase):
                 for item in active_tests
             )
         )
+
         self.assertEqual(sent_tests[0]["baseline_status"], "partial")
         self.assertEqual(
             sent_tests[0]["route_template"],
@@ -930,6 +932,150 @@ class BolaAnalyzerTests(unittest.TestCase):
                 for finding in report["findings"]
             )
         )
+
+    def test_full_scan_selects_all_eligible_groups_without_probing_auth_or_templates(self):
+        requests = []
+
+        def mocked_request(method, url, headers=None):
+            requests.append((method, url))
+            return httpx.Response(
+                401,
+                json={"message": "unauthorized"},
+                request=httpx.Request(method, url),
+            )
+
+        endpoints = [
+            {"method": "GET", "path": path, "responses": [{"sc": 200}]}
+            for path in (
+                "/api/orders",
+                "/api/users",
+                "/api/products",
+                "/api/accounts",
+                "/api/projects",
+                "/api/inventory",
+                "/api/billing",
+                "/api/orders/1",
+                "/api/orders/2",
+                "/api/orders/{id}",
+                "/api/auth/session",
+            )
+        ]
+        modules = Modules()
+        with patch.dict(
+            os.environ,
+            {
+                "MICROSCAN_JWT_ENDPOINT_ALLOWLIST": "[]",
+                "MICROSCAN_JWT_ENDPOINT_BUDGET": "1",
+                "MICROSCAN_BOLA_REQUEST_BUDGET": "1",
+                "MICROSHIELD_USERNAME": "",
+                "MICROSHIELD_PASSWORD": "",
+                "MICROSCAN_LOGIN_PAYLOAD": "",
+                "MICROSCAN_AUTH_CONFIG": "",
+                "MICROSCAN_LOGIN_ENDPOINT": "",
+            },
+            clear=True,
+        ), patch.object(
+            AuthenticationTest, "_run_http_request", side_effect=mocked_request
+        ):
+            analyzed = modules.analyze_endpoints(
+                "http://127.0.0.1:8085",
+                endpoints,
+                auto_jwt_local_lab=True,
+                scan_mode="full",
+            )
+
+        selected = [item for item in analyzed if item["jwt_selected"]]
+        self.assertEqual(len(selected), 9)
+        self.assertTrue(all(item["jwt_eligible"] for item in selected))
+        self.assertTrue(
+            all(
+                item["jwt_selection_budget"]["configured"] is None
+                and item["jwt_selection_budget"]["used"] == 8
+                and item["jwt_selection_budget"]["remaining"] is None
+                for item in analyzed
+            )
+        )
+        dynamic = next(item for item in analyzed if item["path"] == "/api/orders/{id}")
+        self.assertFalse(dynamic["jwt_selected"])
+        self.assertIn("unresolved dynamic template", dynamic["jwt_selection_reason"])
+        auth_route = next(
+            item for item in analyzed if item["path"] == "/api/auth/session"
+        )
+        self.assertFalse(auth_route["jwt_selected"])
+        self.assertIn("authentication", auth_route["jwt_selection_reason"].lower())
+        self.assertTrue(all("{id}" not in url for _, url in requests))
+        self.assertTrue(
+            all(
+                any(url.endswith(f"/api/orders/{identifier}") for _, url in requests)
+                for identifier in ("1", "2")
+            )
+        )
+        self.assertFalse(
+            any(
+                "limited to 1 endpoint groups" in item["jwt_selection_reason"]
+                for item in analyzed
+            )
+        )
+
+        report = build_pentest_report(analyzed, scan_mode="full")
+        summary = report["summary"]
+        self.assertEqual(summary["scan_mode"], "full")
+        self.assertEqual(summary["eligible_endpoints"], 9)
+        self.assertEqual(summary["selected_endpoints"], 9)
+        self.assertEqual(summary["actually_tested_endpoints"], 9)
+        self.assertEqual(summary["excluded_endpoints"], 2)
+        self.assertEqual(summary["eligible_but_not_selected_endpoints"], 0)
+        self.assertEqual(summary["test_cases_attempted"], summary["request_count"])
+        self.assertLessEqual(
+            summary["test_cases_completed"], summary["total_test_cases"]
+        )
+
+    def test_cancellation_stops_before_starting_another_endpoint(self):
+        requests = []
+        cancellation_event = threading.Event()
+
+        def mocked_request(method, url, headers=None):
+            requests.append(url)
+            return httpx.Response(
+                401,
+                json={"message": "unauthorized"},
+                request=httpx.Request(method, url),
+            )
+
+        def cancel_after_first_endpoint(event):
+            cancellation_event.set()
+
+        endpoints = [
+            {"method": "GET", "path": path, "responses": [{"sc": 200}]}
+            for path in ("/api/orders", "/api/users", "/api/products")
+        ]
+        with patch.dict(
+            os.environ,
+            {
+                "MICROSCAN_JWT_ENDPOINT_ALLOWLIST": "[]",
+                "MICROSHIELD_USERNAME": "",
+                "MICROSHIELD_PASSWORD": "",
+                "MICROSCAN_LOGIN_PAYLOAD": "",
+                "MICROSCAN_AUTH_CONFIG": "",
+                "MICROSCAN_LOGIN_ENDPOINT": "",
+            },
+            clear=True,
+        ), patch.object(
+            AuthenticationTest, "_run_http_request", side_effect=mocked_request
+        ):
+            analyzed = Modules().analyze_endpoints(
+                "http://127.0.0.1:8085",
+                endpoints,
+                auto_jwt_local_lab=True,
+                scan_mode="full",
+                progress_callback=cancel_after_first_endpoint,
+                cancellation_event=cancellation_event,
+            )
+
+        self.assertTrue(cancellation_event.is_set())
+        self.assertLess(len(requests), 6)
+        self.assertTrue(analyzed[0]["test_results"])
+        self.assertEqual(analyzed[1]["test_results"], [])
 
     def test_active_bola_does_not_send_without_authenticated_baseline(self):
         response = httpx.Response(

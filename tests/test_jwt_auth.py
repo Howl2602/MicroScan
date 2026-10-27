@@ -1981,12 +1981,20 @@ class AuthenticationTestTests(unittest.TestCase):
                 [{"method": "GET", "path": "/api/orders/1", "status": 401}],
                 auto_jwt_local_lab=True,
             )
+            non_local_full = self.modules.analyze_endpoints(
+                "https://example.test",
+                [{"method": "GET", "path": "/api/orders/1", "status": 401}],
+                auto_jwt_local_lab=True,
+                scan_mode="full",
+            )
 
         request.assert_not_called()
         self.assertFalse(not_confirmed[0]["jwt_selected"])
         self.assertIn("disabled for this scan", not_confirmed[0]["jwt_selection_reason"])
         self.assertFalse(non_local[0]["jwt_selected"])
         self.assertIn("loopback target", non_local[0]["jwt_selection_reason"])
+        self.assertFalse(non_local_full[0]["jwt_selected"])
+        self.assertIn("loopback target", non_local_full[0]["jwt_selection_reason"])
 
     @patch.dict(
         os.environ,

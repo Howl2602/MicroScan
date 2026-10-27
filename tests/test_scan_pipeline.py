@@ -1084,7 +1084,11 @@ class ScanPipelineTests(unittest.TestCase):
         ):
             response = self.client.get(
                 "/scan",
-                params={"target": FRONTEND, "stream": "true"},
+                params={
+                    "target": FRONTEND,
+                    "stream": "true",
+                    "scan_mode": "full",
+                },
             )
 
         self.assertEqual(response.status_code, 200)
@@ -1103,6 +1107,7 @@ class ScanPipelineTests(unittest.TestCase):
         self.assertIn("Security Testing", stage_names)
         self.assertEqual(events[-1]["type"], "complete")
         self.assertEqual(events[-1]["payload"]["target"], FRONTEND)
+        self.assertEqual(events[-1]["payload"]["summary"]["scan_mode"], "full")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_trusted_local_profile_uses_gateway_without_manual_configuration(self):

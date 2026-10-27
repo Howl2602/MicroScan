@@ -15,6 +15,9 @@ _READ_ONLY_METHODS = {"GET"}
 _MAX_AUTOMATIC_JWT_ENDPOINTS = 5
 _MAX_CONFIGURED_JWT_ENDPOINTS = 100
 _DEFAULT_ACTIVE_BOLA_REQUEST_BUDGET = 10
+_DYNAMIC_PATH_SEGMENT = re.compile(
+    r"(?:\$\{[^}]+\}|\{[^}]+\}|:[A-Za-z_][A-Za-z0-9_]*|\*)"
+)
 
 
 class Modules:
@@ -413,7 +416,13 @@ class Modules:
         auto_jwt_local_lab=False,
         discovered_inventory=None,
         discovered_route_templates=None,
+        scan_mode="standard",
+        progress_callback=None,
+        cancellation_event=None,
     ):
+        if scan_mode not in {"standard", "full"}:
+            raise ValueError("scan_mode must be either 'standard' or 'full'.")
+
         analyzed = []
         seen = set()
         for endpoint in results:
@@ -423,6 +432,8 @@ class Modules:
             path, path_error = self._discovered_path(endpoint, target)
             if path is None:
                 path = endpoint.get("path") or endpoint.get("target") or "/"
+            elif _DYNAMIC_PATH_SEGMENT.search(path):
+                path_error = "Discovered endpoint path is an unresolved dynamic template."
                 if not isinstance(path, str):
                     path = "/"
             identity = (method, path)
@@ -497,6 +508,7 @@ class Modules:
 
         auto_mode_reason = None
         selected_reasons = {}
+        eligible_identities = set()
         automatic_skip_reasons = {}
         selection_budget = {
             "mode": None,
@@ -507,10 +519,16 @@ class Modules:
         if allowlist:
             selection_mode = "explicit_allowlist"
             selection_budget["mode"] = selection_mode
-            selected_reasons = {
-                identity: "Endpoint explicitly included in JWT endpoint allowlist."
+            eligible_identities = {
+                identity
                 for identity in allowlist_set
                 if identity in endpoints_by_identity
+                and identity[0] in _READ_ONLY_METHODS
+                and not endpoints_by_identity[identity].get("jwt_path_error")
+            }
+            selected_reasons = {
+                identity: "Endpoint explicitly included in JWT endpoint allowlist."
+                for identity in eligible_identities
             }
         elif auto_jwt_local_lab and self._is_local_target(target):
             selection_mode = "automatic_local_lab"
@@ -520,8 +538,11 @@ class Modules:
                 if endpoint.get("discovery_source") != "discovery":
                     continue
                 identity = (endpoint.get("method") or "", endpoint.get("path"))
+                if endpoint.get("jwt_path_error"):
+                    continue
                 reason = self._automatic_candidate_reason(endpoint)
                 if reason:
+                    eligible_identities.add(identity)
                     group = (identity[0], self._automatic_route_group(identity[1]))
                     candidates_by_group.setdefault(group, []).append(
                         (discovery_index, endpoint, identity, reason)
@@ -537,21 +558,34 @@ class Modules:
                 )
                 representatives.append((group, representative))
 
-            endpoint_budget = self._automatic_endpoint_budget()
-            selected_groups = {
-                group
-                for group, _ in sorted(
+            endpoint_budget = (
+                None
+                if scan_mode == "full"
+                else self._automatic_endpoint_budget()
+            )
+            ordered_representatives = sorted(
                     representatives,
                     key=lambda item: self._automatic_endpoint_priority(
                         item[1][1], item[1][0]
                     ),
-                )[:endpoint_budget]
+                )
+            selected_groups = {
+                group
+                for group, _ in (
+                    ordered_representatives
+                    if endpoint_budget is None
+                    else ordered_representatives[:endpoint_budget]
+                )
             }
             selection_budget.update(
                 {
                     "configured": endpoint_budget,
                     "used": len(selected_groups),
-                    "remaining": max(endpoint_budget - len(selected_groups), 0),
+                    "remaining": (
+                        None
+                        if endpoint_budget is None
+                        else max(endpoint_budget - len(selected_groups), 0)
+                    ),
                 }
             )
             representative_by_group = {
@@ -561,14 +595,18 @@ class Modules:
                 representative = representative_by_group[group]
                 representative_identity = representative[2]
                 if group in selected_groups:
-                    selected_reasons[representative_identity] = representative[3]
-                    for _, _, identity, _ in candidates:
-                        if identity != representative_identity:
-                            automatic_skip_reasons[identity] = (
-                                f"Grouped with representative GET {representative_identity[1]} "
-                                "because it has the same route shape; this endpoint was not "
-                                "tested and its result is not inferred."
-                            )
+                    if scan_mode == "full":
+                        for _, _, identity, reason in candidates:
+                            selected_reasons[identity] = reason
+                    else:
+                        selected_reasons[representative_identity] = representative[3]
+                        for _, _, identity, _ in candidates:
+                            if identity != representative_identity:
+                                automatic_skip_reasons[identity] = (
+                                    f"Grouped with representative GET {representative_identity[1]} "
+                                    "because it has the same route shape; this endpoint was not "
+                                    "tested and its result is not inferred."
+                                )
                 else:
                     for _, _, identity, _ in candidates:
                         automatic_skip_reasons[identity] = (
@@ -593,13 +631,32 @@ class Modules:
 
         self.authentication_test.reset_scan_state()
         try:
-            for endpoint in analyzed:
+            selected_count = len(selected_reasons)
+            for index, endpoint in enumerate(analyzed, start=1):
+                if cancellation_event and cancellation_event.is_set():
+                    break
                 identity = (endpoint.get("method") or "", endpoint.get("path"))
                 is_allowlisted = identity in allowlist_set
                 endpoint["jwt_allowlisted"] = is_allowlisted
+                endpoint["jwt_eligible"] = identity in eligible_identities
                 endpoint["jwt_selection_mode"] = selection_mode
                 endpoint["jwt_selection_budget"] = dict(selection_budget)
                 reason = selected_reasons.get(identity)
+
+                def report_progress():
+                    if progress_callback:
+                        progress_callback(
+                            {
+                                "stage": "Security Testing",
+                                "status": "running",
+                                "detail": (
+                                    f"Assessed endpoint record {index} of {len(analyzed)}; "
+                                        f"{selected_count} JWT endpoint(s) selected; "
+                                    f"{max(len(analyzed) - index, 0)} endpoint record(s) remain."
+                                ),
+                            }
+                        )
+
                 if endpoint.get("discovery_source") == "configured_allowlist":
                     endpoint["jwt_selected"] = False
                     endpoint["jwt_selection_reason"] = (
@@ -610,6 +667,7 @@ class Modules:
                             endpoint, endpoint["jwt_selection_reason"]
                         )
                     )
+                    report_progress()
                     continue
                 if endpoint.get("jwt_path_error"):
                     endpoint["jwt_selected"] = False
@@ -619,6 +677,7 @@ class Modules:
                             endpoint, endpoint["jwt_selection_reason"]
                         )
                     )
+                    report_progress()
                     continue
                 if not reason:
                     if allowlist:
@@ -652,6 +711,7 @@ class Modules:
                             endpoint, skip_reason
                         )
                     )
+                    report_progress()
                     continue
 
                 if identity[0] not in _READ_ONLY_METHODS:
@@ -665,6 +725,7 @@ class Modules:
                             endpoint, endpoint["jwt_selection_reason"]
                         )
                     )
+                    report_progress()
                     continue
 
                 endpoint["jwt_selected"] = True
@@ -703,6 +764,7 @@ class Modules:
                     selected_candidate=candidate,
                 )
                 endpoint["test_results"].append(result)
+                report_progress()
             bola_data = BolaAnalyzer(self.endpoint_selector).analyze(analyzed)
             endpoints_by_identity = {
                 (endpoint.get("method"), endpoint.get("path")): endpoint

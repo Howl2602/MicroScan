@@ -1,4 +1,4 @@
-import { Component, useEffect, useMemo, useState } from 'react'
+import { Component, useEffect, useMemo, useRef, useState } from 'react'
 import {
   buildApiTree,
   filterDiscoveryResults,
@@ -283,7 +283,8 @@ function DiscoveryProgress({ stages, loading }) {
           />
           {(stage.stage.includes('Discovery') ||
             stage.stage === 'Authorized Scope' ||
-            stage.stage === 'API Origin Candidates') && stage.detail && (
+            stage.stage === 'API Origin Candidates' ||
+            stage.stage === 'Security Testing') && stage.detail && (
             <Typography
               color="text.secondary"
               variant="caption"
@@ -1177,6 +1178,8 @@ function ExecutiveSummary({ summary }) {
 
 function App() {
   const [target, setTarget] = useState('http://localhost:3000')
+  const [scanMode, setScanMode] = useState('standard')
+  const scanAbortController = useRef(null)
   const [additionalScopeOrigins, setAdditionalScopeOrigins] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
   const [scanResults, setScanResults] = useState([])
@@ -1237,6 +1240,8 @@ function App() {
     setLoading(true)
     setError('')
     setScanStages([])
+    const controller = new AbortController()
+    scanAbortController.current = controller
 
     try {
       const extraOrigins = additionalScopeOrigins
@@ -1247,11 +1252,13 @@ function App() {
         target: scanTarget,
         num: '200',
         auto_jwt_local_lab: 'true',
+        scan_mode: scanMode,
         stream: 'true',
       })
       extraOrigins.forEach((origin) => scanParams.append('scope_origins', origin))
       const response = await fetch(
-        `${backendUrl}/scan?${scanParams.toString()}`
+        `${backendUrl}/scan?${scanParams.toString()}`,
+        { signal: controller.signal }
       )
 
       if (!response.ok) {
@@ -1317,11 +1324,49 @@ function App() {
         throw new Error(payload?.detail || `HTTP ${completed.status_code}`)
       }
     } catch (caughtError) {
-      setError(caughtError.message || 'The scan could not be completed.')
+      if (caughtError.name === 'AbortError') {
+        setError('Scan cancelled before a complete report was returned.')
+        setScanResults([])
+        setScanResultsTarget('')
+        setScanDiscoveryResults([])
+        setFileDiscoveryResults([])
+        setFileDiscoverySummary({})
+        setFileDiscoveryError('')
+        setFindings([])
+        setEndpointAssessments([])
+        setBolaAssessments([])
+        setBolaBaselines([])
+        setBolaActiveTests([])
+        setSummary({
+          scan_mode: scanMode,
+          scan_status: 'cancelled',
+          overall_conclusion: {
+            code: 'scan_cancelled',
+            label: 'Scan Cancelled',
+            message: 'The scan was cancelled before all tests completed.',
+          },
+          coverage_complete: false,
+          coverage_limitations: ['The scan was cancelled before completion.'],
+        })
+        setScanStages((current) =>
+          current.map((stage) =>
+            stage.status === 'running'
+              ? { ...stage, status: 'cancelled', detail: 'Scan cancelled before this stage completed.' }
+              : stage
+          )
+        )
+      } else {
+        setError(caughtError.message || 'The scan could not be completed.')
+      }
     } finally {
+      if (scanAbortController.current === controller) {
+        scanAbortController.current = null
+      }
       setLoading(false)
     }
   }
+
+  const cancelScan = () => scanAbortController.current?.abort()
 
   const runFileDiscovery = async () => {
     setFileDiscoveryLoading(true)
@@ -1550,6 +1595,30 @@ function App() {
                 }}
               />
 
+              <FormControl sx={{ minWidth: 180 }}>
+                <InputLabel id="scan-mode-label">Scan mode</InputLabel>
+                <Select
+                  labelId="scan-mode-label"
+                  id="scan-mode"
+                  value={scanMode}
+                  label="Scan mode"
+                  onChange={(event) => setScanMode(event.target.value)}
+                  disabled={loading}
+                >
+                  <MenuItem value="standard">Standard Scan</MenuItem>
+                  <MenuItem value="full">Full Scan</MenuItem>
+                </Select>
+              </FormControl>
+              <Typography
+                sx={{ flexBasis: '100%' }}
+                color="text.secondary"
+                variant="body2"
+              >
+                Standard Scan preserves the default selection and prioritization.
+                Full Scan may take longer and generate more requests; scope,
+                endpoint eligibility, and per-module safety limits still apply.
+              </Typography>
+
               <Box
                 component="details"
                 sx={{ flexBasis: '100%', mt: 1, color: 'text.secondary' }}
@@ -1612,6 +1681,24 @@ function App() {
                 {loading && <CircularProgress size={16} color="inherit" />}
                 {loading ? 'SCANNING...' : 'SCAN'}
               </Box>
+              {loading && (
+                <Box
+                  component="button"
+                  onClick={cancelScan}
+                  sx={{
+                    px: 2,
+                    py: 1.5,
+                    border: '1px solid #64748B',
+                    borderRadius: 1,
+                    backgroundColor: 'transparent',
+                    color: 'text.primary',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  CANCEL SCAN
+                </Box>
+              )}
             </Box>
             <DiscoveryProgress stages={scanStages} loading={loading} />
             <Box sx={{ mt: 4 }}>
@@ -1620,11 +1707,20 @@ function App() {
               </Typography>
               <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 1, mb: 3 }}>
                 {[
+                  ['Scan mode', summary.scan_mode === 'full' ? 'Full Scan' : 'Standard Scan'],
                   ['Discovery inventory records', summary.discovery_inventory_records ?? summary.discovery_inventory_endpoints ?? scanDiscoveryResults.length],
+                  ['Eligible API records', summary.security_input_endpoints ?? 0],
+                  ['JWT-eligible endpoints', summary.jwt_eligible_endpoints ?? 0],
                   ['Actionable endpoints', summary.actionable_discovery_endpoints ?? 0],
                   ['Not Found excluded', summary.excluded_not_found_discovery_endpoints ?? 0],
-                  ['Selected for testing', summary.selected_endpoints ?? 0],
-                  ['Actually tested', summary.tested_endpoints ?? 0],
+                  ['Endpoints selected', summary.selected_endpoints ?? 0],
+                  ['Actually tested endpoints', summary.tested_endpoints ?? 0],
+                  ['Skipped or excluded endpoints', summary.skipped_endpoints ?? 0],
+                  ['Test cases attempted', summary.test_cases_attempted ?? 0],
+                  ['Test cases completed', summary.test_cases_completed ?? 0],
+                  ['Test cases inconclusive', summary.inconclusive_tests ?? 0],
+                  ['Test case errors', summary.error_tests ?? 0],
+                  ['Not implemented', summary.not_implemented_test_cases ?? 0],
                   ['New routes', (summary.discovery_rounds ?? []).reduce((total, round) => total + (round.new_results ?? 0), 0)],
                   ['Duplicate results', (summary.discovery_rounds ?? []).reduce((total, round) => total + (round.duplicate_results ?? 0), 0)],
                   ['Failed / skipped stages', scanStages.filter((stage) => ['failed', 'error', 'skipped'].includes(stage.status)).length],

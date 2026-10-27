@@ -3,6 +3,7 @@ import ast
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -1650,7 +1651,12 @@ async def _run_scan_pipeline(
     auto_jwt_local_lab,
     progress_callback=None,
     scope_origins=None,
+    scan_mode="standard",
+    cancel_event=None,
 ):
+    if scan_mode not in {"standard", "full"}:
+        raise ValueError("scan_mode must be either 'standard' or 'full'.")
+
     normalized_target = validate_target(target)
     stages = {}
 
@@ -2474,6 +2480,7 @@ async def _run_scan_pipeline(
         report = build_pentest_report(
             scan_failed=True,
             failure_reason="All discovery stages failed before evidence collection.",
+            scan_mode=scan_mode,
         )
         _set_security_dispositions(
             discovery_results,
@@ -2506,7 +2513,22 @@ async def _run_scan_pipeline(
             },
         }
 
-    await emit("Security Testing", "running")
+    await emit(
+        "Security Testing",
+        "running",
+        f"Evaluating {len(endpoints_for_testing)} eligible endpoint record(s) "
+        f"in {scan_mode.title()} Scan mode.",
+    )
+    security_progress_futures = []
+    progress_loop = asyncio.get_running_loop()
+
+    def report_security_progress(event):
+        if progress_callback:
+            future = asyncio.run_coroutine_threadsafe(
+                progress_callback(event), progress_loop
+            )
+            security_progress_futures.append(future)
+
     try:
         analyzed = await asyncio.to_thread(
             Modules().analyze_endpoints,
@@ -2520,7 +2542,19 @@ async def _run_scan_pipeline(
                 if isinstance(item, dict)
                 and (item.get("template") or item.get("is_template"))
             ],
+            scan_mode=scan_mode,
+            progress_callback=report_security_progress
+            if progress_callback
+            else None,
+            cancellation_event=cancel_event,
         )
+        if security_progress_futures:
+            await asyncio.gather(
+                *(
+                    asyncio.wrap_future(future)
+                    for future in security_progress_futures
+                )
+            )
     except ValueError:
         raise
     except Exception as exc:
@@ -2529,6 +2563,7 @@ async def _run_scan_pipeline(
         report = build_pentest_report(
             scan_failed=True,
             failure_reason="Security testing failed after discovery.",
+            scan_mode=scan_mode,
         )
         _set_security_dispositions(
             discovery_results,
@@ -2577,7 +2612,7 @@ async def _run_scan_pipeline(
                 "verification_status", "discovered"
             )
             endpoint["discovery_evidence"] = correlated.get("discovery_evidence", [])
-    report = build_pentest_report(analyzed)
+    report = build_pentest_report(analyzed, scan_mode=scan_mode)
     selected_count = sum(1 for endpoint in analyzed if endpoint.get("jwt_selected"))
     tested_count = report["summary"]["tested_endpoints"]
     request_count = report["summary"]["request_count"]
@@ -2758,6 +2793,7 @@ async def _run_scan_pipeline(
             )
     summary.update(
         {
+            "scan_mode": scan_mode,
             "jwt_authentication_workflow": login_summary,
             "total_endpoints": discovered_count,
             "discovered_endpoints": discovered_count,
@@ -2771,6 +2807,9 @@ async def _run_scan_pipeline(
             "discovery_inconclusive_endpoints": discovery_category_counts["inconclusive"],
             "discovery_inventory_endpoints": len(discovery_results),
             "security_input_endpoints": len(endpoints_for_testing),
+            "jwt_eligible_endpoints": report["summary"].get(
+                "eligible_endpoints", 0
+            ),
             "jwt_inventory_excluded_endpoints": len(jwt_inventory_exclusions),
             "jwt_inventory_exclusion_reasons": jwt_inventory_exclusions,
             "jwt_unsupported_method_endpoints": sum(
@@ -2947,9 +2986,11 @@ async def file_discovery(request: FileDiscoveryRequest):
 
 @app.get("/scan")
 async def scan(
+    request: Request,
     target: str,
     num: int = 1000,
     auto_jwt_local_lab: bool = False,
+    scan_mode: str = "standard",
     stream: bool = False,
     scope_origins: list[str] = Query(default=[]),
 ):
@@ -2960,6 +3001,7 @@ async def scan(
                 num,
                 auto_jwt_local_lab,
                 scope_origins=scope_origins,
+                scan_mode=scan_mode,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2967,6 +3009,7 @@ async def scan(
 
     async def event_stream():
         queue = asyncio.Queue()
+        cancel_event = threading.Event()
 
         async def progress(event):
             await queue.put({"type": "progress", **event})
@@ -2979,6 +3022,8 @@ async def scan(
                     auto_jwt_local_lab,
                     progress,
                     scope_origins,
+                    scan_mode,
+                    cancel_event,
                 )
                 await queue.put(
                     {"type": "complete", "status_code": status, "payload": payload}
@@ -3006,6 +3051,7 @@ async def scan(
                     break
                 yield f"data: {json.dumps(event)}\n\n"
         finally:
+            cancel_event.set()
             if not task.done():
                 task.cancel()
 
