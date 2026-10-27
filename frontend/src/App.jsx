@@ -1,4 +1,4 @@
-import { Component, useMemo, useState } from 'react'
+import { Component, useEffect, useMemo, useState } from 'react'
 import {
   buildApiTree,
   filterDiscoveryResults,
@@ -422,7 +422,7 @@ function DiscoveryCategoryFilter({ id, value, onChange }) {
   )
 }
 
-function EndpointAssessments({ assessments }) {
+function EndpointAssessments({ assessments, findings = [] }) {
   if (assessments.length === 0) {
     return (
       <Typography color="text.secondary" sx={{ mt: 2 }}>
@@ -489,7 +489,14 @@ function EndpointAssessments({ assessments }) {
                   )}
                 </TableCell>
                 <TableCell>
-                  {testCase.evidence ? (
+                  {testCase.evidence && findings.some(
+                    (finding) =>
+                      finding.method === endpoint.method &&
+                      finding.endpoint === endpoint.path &&
+                      finding.test_case === testCase.test_case,
+                  ) ? (
+                    'Evidence is shown in the selected finding details.'
+                  ) : testCase.evidence ? (
                     <Box component="details">
                       <Box component="summary" sx={{ cursor: 'pointer' }}>
                         View evidence
@@ -738,6 +745,305 @@ function VulnerabilityFindings({ findings }) {
   ))
 }
 
+function findingDescription(name = '') {
+  const normalized = name.toLowerCase()
+  if (normalized.includes('bola') || normalized.includes('object level')) {
+    return 'An object may be accessible without confirming that the requester is authorized to access it.'
+  }
+  if (normalized.includes('jwt') || normalized.includes('authentication') || normalized.includes('auth') || normalized.includes('token') || normalized.includes('unauthenticated')) {
+    return 'The endpoint may return protected data without successfully enforcing the expected authentication checks.'
+  }
+  return 'The scan recorded evidence that may indicate a security issue at this endpoint.'
+}
+
+function FindingDetail({ findings, endpointAssessments, target, onClose }) {
+  if (findings.length === 0) return null
+  const finding = findings[0]
+  const endpoint = endpointAssessments.find(
+    (item) => item.method === finding.method && item.path === finding.endpoint,
+  )
+  const statuses = [...new Set(findings.map((item) => item.status))]
+  const statusLabel = statuses.length > 1
+    ? 'Confirmed and potential'
+    : statuses[0] === 'confirmed'
+      ? 'Confirmed'
+      : 'Potential'
+  const identityEvidence = findings
+    .map((item) => item.evidence?.identifier_comparison ?? item.evidence?.owner_identity_evidence)
+    .filter(Boolean)
+
+  return (
+    <Card id="finding-detail" sx={{ mt: 3, scrollMarginTop: 16 }}>
+      <CardContent>
+        <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, alignItems: 'flex-start' }}>
+          <Box>
+            <Typography color="text.secondary" variant="body2" aria-label="Breadcrumb">
+              Scan Reports › {finding.name} › {finding.method} {finding.endpoint}
+            </Typography>
+            <Typography variant="h6" sx={{ mt: 1 }}>
+              {finding.method} {finding.endpoint}
+            </Typography>
+          </Box>
+          <Chip
+            label={statusLabel}
+            color={statuses.includes('confirmed') ? 'error' : 'warning'}
+            size="small"
+          />
+        </Box>
+        <Typography variant="subtitle2" sx={{ mt: 2 }}>What this means</Typography>
+        <Typography variant="body2" color="text.secondary">
+          {findingDescription(finding.name)}
+        </Typography>
+        <Typography variant="subtitle2" sx={{ mt: 2 }}>Why it was flagged</Typography>
+        {findings.map((item, index) => (
+          <Box key={`${item.test_case}-${index}`} sx={{ mb: 0.75 }}>
+            <Typography variant="body2" color="text.secondary">
+              {item.reason || 'The report contains evidence for this finding.'}
+            </Typography>
+            {item.request_condition && (
+              <Typography variant="body2" color="text.secondary">
+                Test condition: {item.request_condition}
+              </Typography>
+            )}
+            {item.unverified && (
+              <Typography variant="body2" color="text.secondary">
+                Limitation: {item.unverified}
+              </Typography>
+            )}
+          </Box>
+        ))}
+        <Typography variant="subtitle2" sx={{ mt: 2 }}>Test status and scope</Typography>
+        <Typography variant="body2" color="text.secondary">
+          Finding status: {statusLabel}. Endpoint assessment: {endpoint?.assessment ?? 'Not reported'}.
+          {endpoint?.reason ? ` — ${endpoint.reason}` : ''}
+        </Typography>
+        <Typography variant="body2" color="text.secondary">
+          Test case: {[...new Set(findings.map((item) => item.test_case).filter(Boolean))].join(', ') || 'Not reported'}
+        </Typography>
+        {identityEvidence.length > 0 && (
+          <>
+            <Typography variant="subtitle2" sx={{ mt: 2 }}>Observed owner / identity comparison</Typography>
+            <Box component="pre" sx={technicalEvidenceStyle}>
+              {JSON.stringify(identityEvidence, null, 2)}
+            </Box>
+          </>
+        )}
+        {findings.some((item) => item.evidence) && (
+          <Box component="details" sx={{ mt: 2 }}>
+            <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 600 }}>
+              View sanitized request / response evidence
+            </Box>
+            {findings.filter((item) => item.evidence).map((item, index) => (
+              <Box key={`${item.test_case}-${index}`} component="pre" sx={technicalEvidenceStyle}>
+                {JSON.stringify(item.evidence, null, 2)}
+              </Box>
+            ))}
+          </Box>
+        )}
+        <Typography variant="subtitle2" sx={{ mt: 2 }}>Recommended remediation</Typography>
+        {findings.map((item, index) => (
+          <Typography key={`${item.test_case}-recommendation-${index}`} variant="body2">
+            {item.recommendation || 'Review and enforce the intended authorization policy.'}
+          </Typography>
+        ))}
+        {target && (
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 2 }}>
+            Scan target: {target}
+          </Typography>
+        )}
+        <Box component="button" type="button" onClick={onClose} sx={reportButtonStyle}>
+          Close details
+        </Box>
+      </CardContent>
+    </Card>
+  )
+}
+
+const technicalEvidenceStyle = {
+  mt: 1,
+  p: 1.5,
+  borderRadius: 1,
+  backgroundColor: '#0B1120',
+  color: '#CBD5E1',
+  whiteSpace: 'pre-wrap',
+  overflowWrap: 'anywhere',
+  fontSize: '0.8rem',
+}
+
+const reportButtonStyle = {
+  mt: 2,
+  px: 1.5,
+  py: 0.75,
+  border: '1px solid #475569',
+  borderRadius: 1,
+  color: 'inherit',
+  backgroundColor: 'transparent',
+  cursor: 'pointer',
+  font: 'inherit',
+  '&:focus-visible': { outline: '2px solid #38BDF8', outlineOffset: 2 },
+}
+
+function FindingGroups({ findings, onSelect }) {
+  if (findings.length === 0) {
+    return (
+      <Alert severity="info" sx={{ mt: 2 }}>
+        No confirmed or potential findings were reported. Review coverage limitations before interpreting this as a clean scan.
+      </Alert>
+    )
+  }
+
+  const groups = new Map()
+  findings.forEach((finding, index) => {
+    const name = finding.name || 'Other security finding'
+    if (!groups.has(name)) groups.set(name, [])
+    groups.get(name).push({ finding, index })
+  })
+
+  return (
+    <Box sx={{ mt: 2 }}>
+      {[...groups.entries()].map(([name, entries]) => {
+        const statuses = [...new Set(entries.map(({ finding }) => finding.status))]
+        const groupStatus = statuses.length > 1
+          ? 'Mixed status'
+          : statuses[0] === 'confirmed'
+            ? 'Confirmed'
+            : statuses[0] === 'potential'
+              ? 'Potential'
+              : 'Inconclusive'
+        const endpoints = new Set(entries.map(({ finding }) => `${finding.method} ${finding.endpoint}`))
+        const assessedSeverity = entries
+          .map(({ finding }) => finding.severity)
+          .find((severity) => typeof severity === 'string' && severity.trim())
+
+        return (
+          <Box
+            component="details"
+            key={name}
+            sx={{ mb: 1, border: '1px solid #334155', borderRadius: 1, px: 1.5, py: 1 }}
+          >
+            <Box
+              component="summary"
+              sx={{ cursor: 'pointer', '&:focus-visible': { outline: '2px solid #38BDF8' } }}
+            >
+              <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+                <Typography component="span" variant="subtitle1" sx={{ fontWeight: 600 }}>{name}</Typography>
+                <Chip
+                  label={groupStatus}
+                  size="small"
+                  color={statuses.includes('confirmed') ? 'error' : 'warning'}
+                  variant="outlined"
+                />
+                {assessedSeverity && <Chip label={assessedSeverity} size="small" variant="outlined" />}
+                <Typography component="span" variant="body2" color="text.secondary">
+                  {endpoints.size} affected endpoint{endpoints.size === 1 ? '' : 's'}
+                </Typography>
+              </Box>
+              <Typography display="block" variant="body2" color="text.secondary" sx={{ mt: 0.75 }}>
+                {findingDescription(name)}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 0.75, mt: 1.5 }}>
+              {entries.map(({ finding, index }) => (
+                <Box
+                  component="button"
+                  type="button"
+                  key={finding.finding_id ?? `${finding.method}-${finding.endpoint}-${finding.test_case}-${index}`}
+                  onClick={() => onSelect(finding)}
+                  sx={{
+                    ...reportButtonStyle,
+                    mt: 0,
+                    textAlign: 'left',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 1,
+                  }}
+                >
+                  <span>{finding.method} {finding.endpoint}</span>
+                  <Chip
+                    label={finding.status === 'confirmed' ? 'Confirmed' : 'Potential'}
+                    size="small"
+                    color={finding.status === 'confirmed' ? 'error' : 'warning'}
+                  />
+                </Box>
+              ))}
+            </Box>
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
+function ReportOverview({ summary, target, findings, fileDiscoveryError }) {
+  const limitations = Array.isArray(summary.coverage_limitations)
+    ? summary.coverage_limitations
+    : []
+  const discovered = summary.discovered_endpoints ?? summary.total_endpoints
+  const tested = summary.tested_endpoints
+  const endpointCoverageIncomplete =
+    typeof discovered === 'number' && typeof tested === 'number' && tested < discovered
+  const discoveryErrors = Object.values(summary.discovery_errors ?? {}).filter(
+    (message) => typeof message === 'string' && message,
+  )
+  const incomplete = summary.coverage_complete === false ||
+    summary.overall_conclusion?.code === 'scan_failed' ||
+    limitations.length > 0 ||
+    endpointCoverageIncomplete ||
+    discoveryErrors.length > 0 ||
+    Boolean(fileDiscoveryError)
+
+  return (
+    <Box>
+      <Alert severity={incomplete ? 'warning' : 'info'} sx={{ mb: 2 }}>
+        <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+          {summary.overall_conclusion?.label ?? 'Scan completed'}
+        </Typography>
+        {summary.overall_conclusion?.message && (
+          <Typography variant="body2">{summary.overall_conclusion.message}</Typography>
+        )}
+      </Alert>
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+        Target: {target || 'Not reported'}
+      </Typography>
+      <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 1.5 }}>
+        {[
+          ['Confirmed findings', summary.confirmed_findings ?? findings.filter((item) => item.status === 'confirmed').length],
+          ['Potential findings', summary.potential_findings ?? findings.filter((item) => item.status === 'potential').length],
+          ['Endpoints tested / discovered', `${summary.tested_endpoints ?? 0} / ${summary.discovered_endpoints ?? summary.total_endpoints ?? 0}`],
+        ].map(([label, value]) => (
+          <Card key={label} variant="outlined">
+            <CardContent sx={{ '&:last-child': { pb: 2 } }}>
+              <Typography color="text.secondary" variant="body2">{label}</Typography>
+              <Typography variant="h5" sx={{ mt: 0.5 }}>{value}</Typography>
+            </CardContent>
+          </Card>
+        ))}
+      </Box>
+      {incomplete && (
+        <Alert severity="warning" sx={{ mt: 2 }}>
+          <Typography variant="subtitle2">Coverage may be incomplete</Typography>
+          {limitations.length > 0 ? limitations.map((limitation) => (
+            <Typography key={limitation} variant="body2">{limitation}</Typography>
+          )) : endpointCoverageIncomplete ? (
+            <Typography variant="body2">
+              {tested} of {discovered} discovered endpoints were tested.
+            </Typography>
+          ) : (
+            <Typography variant="body2">
+              {summary.failure_reason || 'Some scan stages were incomplete or returned errors.'}
+            </Typography>
+          )}
+          {discoveryErrors.map((message, index) => (
+            <Typography key={`discovery-warning-${index}`} variant="body2">{message}</Typography>
+          ))}
+          {fileDiscoveryError && <Typography variant="body2">{fileDiscoveryError}</Typography>}
+        </Alert>
+      )}
+    </Box>
+  )
+}
+
 function ExecutiveSummary({ summary }) {
   const conclusion = summary.overall_conclusion
   const metrics = [
@@ -883,6 +1189,7 @@ function App() {
   const [bolaBaselines, setBolaBaselines] = useState([])
   const [bolaActiveTests, setBolaActiveTests] = useState([])
   const [summary, setSummary] = useState({})
+  const [selectedFinding, setSelectedFinding] = useState(null)
   const [scanCount, setScanCount] = useState(0)
   const [activePage, setActivePage] = useState('Dashboard')
   const [loading, setLoading] = useState(false)
@@ -905,6 +1212,12 @@ function App() {
   const [discoveryCategoryFilter, setDiscoveryCategoryFilter] = useState('actionable')
   const [apiMapCategory, setApiMapCategory] = useState('actionable')
   const [statusFilter, setStatusFilter] = useState('')
+
+  useEffect(() => {
+    if (selectedFinding) {
+      document.getElementById('finding-detail')?.scrollIntoView({ block: 'nearest' })
+    }
+  }, [selectedFinding])
 
   const endpointSummary = useMemo(() => {
     const discovered = scanResults.filter((item) => item.discovered !== false)
@@ -992,6 +1305,7 @@ function App() {
       setFileDiscoverySummary(payload.discovery_summary ?? {})
       setFileDiscoveryError(payload.discovery_errors?.file_discovery ?? '')
       setFindings(payload.findings ?? [])
+      setSelectedFinding(null)
       setEndpointAssessments(payload.endpoint_assessments ?? [])
       setBolaAssessments(payload.bola_assessments ?? [])
       setBolaBaselines(payload.bola_baselines ?? [])
@@ -1629,144 +1943,189 @@ function App() {
         )}
 
         {activePage === 'Reports' && (
-          <Card>
-            <CardContent>
-              <Typography variant="h6" sx={{ mb: 1 }}>
-                Scan History
-              </Typography>
-              <Typography color="text.secondary" sx={{ mb: 3 }}>
-                Scans recorded during this session: {scanCount}
-              </Typography>
-
-              {scanCount === 0 ? (
-                <Typography color="text.secondary">
-                  No scan history yet. Run a scan from the Scan page first.
+          <Box>
+            <Card>
+              <CardContent>
+                <Typography color="text.secondary" variant="body2">
+                  Scans recorded during this session: {scanCount}
                 </Typography>
-              ) : (
-                <>
-                  <Typography sx={{ mb: 2 }}>
-                    Latest target: {target || 'Not specified'}
+                {scanCount === 0 ? (
+                  <Typography color="text.secondary" sx={{ mt: 2 }}>
+                    No scan history yet. Run a scan from the Scan page first.
                   </Typography>
-                  <DiscoveryProgress stages={scanStages} loading={loading} />
-                  <Typography variant="h6" sx={{ mt: 3, mb: 1 }}>
-                    Unified discovery results ({visibleScanDiscoveryResults.length})
+                ) : (
+                  <ReportOverview
+                    summary={summary}
+                    target={scanResultsTarget || target}
+                    findings={findings}
+                    fileDiscoveryError={fileDiscoveryError}
+                  />
+                )}
+              </CardContent>
+            </Card>
+
+            {scanCount > 0 && (
+              <>
+                <Typography variant="h5" sx={{ mt: 4, mb: 1 }}>Findings</Typography>
+                <FindingGroups
+                  findings={findings}
+                  onSelect={(finding) => setSelectedFinding(finding)}
+                />
+                {selectedFinding && (
+                  <FindingDetail
+                    findings={findings.filter(
+                      (finding) =>
+                        finding.method === selectedFinding.method &&
+                        finding.endpoint === selectedFinding.endpoint &&
+                        finding.name === selectedFinding.name,
+                    )}
+                    endpointAssessments={endpointAssessments}
+                    target={scanResultsTarget || target}
+                    onClose={() => setSelectedFinding(null)}
+                  />
+                )}
+
+                <Box component="details" sx={{ mt: 4, borderTop: '1px solid #334155', pt: 2 }}>
+                  <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
+                    Technical diagnostics
+                  </Box>
+                  <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+                    Detailed scan output is available on request. Coverage limitations remain visible above.
                   </Typography>
                   {fileDiscoveryError && (
-                    <Alert severity="warning" sx={{ mb: 2 }}>
-                      File Discovery stage failed; API Discovery and the remaining scan stages were allowed to continue. {fileDiscoveryError}
+                    <Alert severity="warning" sx={{ mt: 2 }}>
+                      File Discovery stage failed; API Discovery and remaining scan stages continued. {fileDiscoveryError}
                     </Alert>
                   )}
                   {summary.discovery_errors?.api_discovery && (
-                    <Alert severity="warning" sx={{ mb: 2 }}>
+                    <Alert severity="warning" sx={{ mt: 2 }}>
                       API Discovery stage failed. {summary.discovery_errors.api_discovery}
                     </Alert>
                   )}
                   {summary.discovery_errors?.kiterunner_seed_discovery && (
-                    <Alert severity="warning" sx={{ mb: 2 }}>
+                    <Alert severity="warning" sx={{ mt: 2 }}>
                       Seeded API Discovery stage failed. {summary.discovery_errors.kiterunner_seed_discovery}
                     </Alert>
                   )}
-                  <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap', my: 2 }}>
-                    <DiscoveryCategoryFilter
-                      id="report-discovery-category"
-                      value={discoveryCategoryFilter}
-                      onChange={setDiscoveryCategoryFilter}
-                    />
-                    <FormControl size="small" sx={{ minWidth: 190 }}>
-                      <InputLabel id="report-source-label">Discovery source</InputLabel>
-                      <Select labelId="report-source-label" value={sourceFilter} label="Discovery source" onChange={(event) => setSourceFilter(event.target.value)}>
-                        <MenuItem value="all">All sources</MenuItem>
-                        <MenuItem value="kiterunner">Kiterunner</MenuItem>
-                        <MenuItem value="kiterunner_seeded">Kiterunner seed scan</MenuItem>
-                        <MenuItem value="wordlist">File Discovery</MenuItem>
-                        <MenuItem value="html">HTML</MenuItem>
-                        <MenuItem value="javascript">JavaScript</MenuItem>
-                        <MenuItem value="gateway_verification">Gateway verification</MenuItem>
-                      </Select>
-                    </FormControl>
-                    <FormControl size="small" sx={{ minWidth: 190 }}>
-                      <InputLabel id="report-verification-label">Verification</InputLabel>
-                      <Select labelId="report-verification-label" value={verificationFilter} label="Verification" onChange={(event) => setVerificationFilter(event.target.value)}>
-                        <MenuItem value="all">All states</MenuItem>
-                        <MenuItem value="discovered">Discovered</MenuItem>
-                        <MenuItem value="verified">Verified</MenuItem>
-                        <MenuItem value="inconclusive">Inconclusive</MenuItem>
-                        <MenuItem value="blocked">Blocked</MenuItem>
-                        <MenuItem value="not_found">Not found</MenuItem>
-                      </Select>
-                    </FormControl>
-                    <Box component="input" type="number" aria-label="Filter discovery by status code" placeholder="Status code prefix" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} sx={{ width: 180, px: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB' }} />
-                  </Box>
-                  <DiscoveryResultsTable results={visibleScanDiscoveryResults} />
+
                   <Box component="details" sx={{ mt: 2 }}>
                     <Box component="summary" sx={{ cursor: 'pointer' }}>
-                      Excluded / Not Found ({notFoundDiscoveryResults.length})
+                      Discovery stages and command diagnostics
+                    </Box>
+                    <DiscoveryProgress stages={scanStages} loading={loading} />
+                    {scanStages.map((stage, index) => (
+                      <Typography key={`${stage.stage}-${index}`} display="block" variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                        {stage.stage}: {stage.status}{stage.detail ? ` — ${stage.detail}` : ''}
+                      </Typography>
+                    ))}
+                    <ExecutiveSummary summary={summary} />
+                  </Box>
+
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Raw discovery evidence ({visibleScanDiscoveryResults.length})
+                    </Box>
+                    <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap', my: 2 }}>
+                      <DiscoveryCategoryFilter
+                        id="report-discovery-category"
+                        value={discoveryCategoryFilter}
+                        onChange={setDiscoveryCategoryFilter}
+                      />
+                      <FormControl size="small" sx={{ minWidth: 190 }}>
+                        <InputLabel id="report-source-label">Discovery source</InputLabel>
+                        <Select labelId="report-source-label" value={sourceFilter} label="Discovery source" onChange={(event) => setSourceFilter(event.target.value)}>
+                          <MenuItem value="all">All sources</MenuItem>
+                          <MenuItem value="kiterunner">Kiterunner</MenuItem>
+                          <MenuItem value="kiterunner_seeded">Kiterunner seed scan</MenuItem>
+                          <MenuItem value="wordlist">File Discovery</MenuItem>
+                          <MenuItem value="html">HTML</MenuItem>
+                          <MenuItem value="javascript">JavaScript</MenuItem>
+                          <MenuItem value="gateway_verification">Gateway verification</MenuItem>
+                        </Select>
+                      </FormControl>
+                      <FormControl size="small" sx={{ minWidth: 190 }}>
+                        <InputLabel id="report-verification-label">Verification</InputLabel>
+                        <Select labelId="report-verification-label" value={verificationFilter} label="Verification" onChange={(event) => setVerificationFilter(event.target.value)}>
+                          <MenuItem value="all">All states</MenuItem>
+                          <MenuItem value="discovered">Discovered</MenuItem>
+                          <MenuItem value="verified">Verified</MenuItem>
+                          <MenuItem value="inconclusive">Inconclusive</MenuItem>
+                          <MenuItem value="blocked">Blocked</MenuItem>
+                          <MenuItem value="not_found">Not found</MenuItem>
+                        </Select>
+                      </FormControl>
+                      <Box component="input" type="number" aria-label="Filter discovery by status code" placeholder="Status code prefix" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} sx={{ width: 180, px: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB' }} />
+                    </Box>
+                    <DiscoveryResultsTable results={visibleScanDiscoveryResults} />
+                  </Box>
+
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Excluded / not-found discovery records ({notFoundDiscoveryResults.length})
                     </Box>
                     <Typography color="text.secondary" variant="body2" sx={{ my: 1 }}>
-                      Raw discovery observations and status codes are retained here for audit; these routes are not included in security testing.
+                      These discovered routes were not included in security testing.
                     </Typography>
                     <DiscoveryResultsTable results={notFoundDiscoveryResults} />
                   </Box>
-                  <ExecutiveSummary summary={summary} />
-                  <Typography sx={{ mb: 1 }}>
-                    JWT selection mode: {summary.jwt_selection_mode ?? 'not_confirmed'}
-                  </Typography>
-                  <Typography color="text.secondary" variant="body2">
-                    Explicit allowlist entries: {summary.jwt_allowlist_entries ?? 0}
-                    {summary.jwt_allowlist_configured ? ' (mandatory scope boundary)' : ''}
-                  </Typography>
-                  {summary.jwt_allowlist_targets?.map((endpoint) => (
-                    <Typography
-                      key={`${endpoint.method}-${endpoint.path}`}
-                      color="text.secondary"
-                      variant="body2"
-                    >
-                      Allowlisted: {endpoint.method} {endpoint.path}
-                    </Typography>
-                  ))}
-                  {summary.skipped_endpoint_reasons?.length > 0 && (
-                    <Box
-                      component="details"
-                      sx={{ mt: 2, mb: 2, border: '1px solid #334155', borderRadius: 1, px: 1.5, py: 1 }}
-                    >
-                      <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 600 }}>
-                        Skipped Discovery endpoints ({summary.skipped_endpoint_reasons.length})
-                      </Box>
-                      {summary.skipped_endpoint_reasons.map((endpoint, index) => (
-                        <Typography
-                          key={`${endpoint.method}-${endpoint.path}-${index}`}
-                          color="text.secondary"
-                          variant="body2"
-                          sx={{ mt: 1 }}
-                        >
-                          {endpoint.method} {endpoint.path}: {endpoint.reason}
-                        </Typography>
-                      ))}
+
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      JWT selection, budgets, and allowlist
                     </Box>
-                  )}
-                  <Typography color="text.secondary" variant="body2">
-                    {findings.length === 0
-                      ? 'No confirmed or potential vulnerability findings were reported.'
-                      : `${findings.length} confirmed or potential vulnerability finding(s) have evidence.`}
-                  </Typography>
-                  <Typography variant="h6" sx={{ mt: 3 }}>
-                    Vulnerability findings
-                  </Typography>
-                  <VulnerabilityFindings findings={findings} />
-                  <Typography variant="h6" sx={{ mt: 3 }}>
-                    Endpoint assessments and test cases
-                  </Typography>
-                  <EndpointAssessments assessments={endpointAssessments} />
-                  <BolaCorrelationResults
-                    assessments={bolaAssessments}
-                    baselines={bolaBaselines}
-                    activeTests={bolaActiveTests}
-                    summary={summary}
-                  />
-                </>
-              )}
-            </CardContent>
-          </Card>
+                    <Typography sx={{ mt: 1 }} variant="body2">
+                      JWT selection mode: {summary.jwt_selection_mode ?? 'not_confirmed'}
+                    </Typography>
+                    <Typography color="text.secondary" variant="body2">
+                      Explicit allowlist entries: {summary.jwt_allowlist_entries ?? 0}
+                      {summary.jwt_allowlist_configured ? ' (mandatory scope boundary)' : ''}
+                    </Typography>
+                    {summary.jwt_allowlist_targets?.map((endpoint) => (
+                      <Typography key={`${endpoint.method}-${endpoint.path}`} color="text.secondary" variant="body2">
+                        Allowlisted: {endpoint.method} {endpoint.path}
+                      </Typography>
+                    ))}
+                    {summary.jwt_selection_budgets?.map((budget, index) => (
+                      <Typography key={`jwt-budget-${index}`} color="text.secondary" variant="body2">
+                        JWT selection budget ({budget.mode ?? 'unknown'}): {budget.used ?? '—'} of {budget.configured ?? 'not applicable'} group(s) used
+                        {budget.remaining != null ? ` · ${budget.remaining} remaining` : ''}
+                      </Typography>
+                    ))}
+                  </Box>
+
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Skipped endpoints ({summary.skipped_endpoint_reasons?.length ?? 0})
+                    </Box>
+                    {summary.skipped_endpoint_reasons?.map((endpoint, index) => (
+                      <Typography key={`${endpoint.method}-${endpoint.path}-${index}`} color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+                        {endpoint.method} {endpoint.path}: {endpoint.reason}
+                      </Typography>
+                    ))}
+                  </Box>
+
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Endpoint test cases and evidence
+                    </Box>
+                    <EndpointAssessments assessments={endpointAssessments} findings={findings} />
+                  </Box>
+
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Passive and active BOLA diagnostics
+                    </Box>
+                    <BolaCorrelationResults
+                      assessments={bolaAssessments}
+                      baselines={bolaBaselines}
+                      activeTests={bolaActiveTests}
+                      summary={summary}
+                    />
+                  </Box>
+                </Box>
+              </>
+            )}
+          </Box>
         )}
 
         {activePage === 'Settings' && (
