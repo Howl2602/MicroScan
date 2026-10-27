@@ -1,9 +1,14 @@
+import logging
 import re
 from urllib.parse import urlsplit
 
 
+logger = logging.getLogger(__name__)
+
+
 class EndpointSelector:
     TEST_MODULE = "jwt_authentication"
+    BOLA_MODULE = "bola_passive_correlation"
     AUTH_PATH_KEYWORDS = (
         "login",
         "log-in",
@@ -43,6 +48,18 @@ class EndpointSelector:
     SENSITIVE_PATH_SEGMENTS = {"admin", "internal", "system", "settings"}
     UNSUITABLE_PATH_SEGMENTS = {"debug", "internal", "health", "metrics"}
     REGISTRATION_PATH_SEGMENTS = {"register", "registration", "signup", "sign-up"}
+    NON_LOGIN_AUTH_PATH_SEGMENTS = {
+        "logout",
+        "signout",
+        "refresh",
+        "reset",
+        "forgot",
+        "recover",
+        "verify",
+        "verification",
+        "callback",
+        "authorize",
+    }
 
     @classmethod
     def _path_segments(cls, path):
@@ -102,9 +119,15 @@ class EndpointSelector:
         if method:
             reason_parts.append(f"method={str(method).upper()}")
 
-        applicable_tests = (
-            [self.TEST_MODULE] if classification == "authentication" else []
-        )
+        applicable_tests = []
+        if classification == "authentication":
+            applicable_tests.append(self.TEST_MODULE)
+        if classification in {
+            "resource_collection",
+            "resource_by_id",
+            "user_or_account",
+        }:
+            applicable_tests.append(self.BOLA_MODULE)
         return {
             "classification": classification,
             "reason": "; ".join(reason_parts),
@@ -220,23 +243,103 @@ class EndpointSelector:
 
     @classmethod
     def discover_login_candidates(cls, discovered_endpoints):
+        allow_methods_by_path = {}
+        method_evidence_count = 0
+        for endpoint in discovered_endpoints or []:
+            if not isinstance(endpoint, dict):
+                continue
+            path = endpoint.get("path") or endpoint.get("discovered_path")
+            if not isinstance(path, str):
+                continue
+            responses = endpoint.get("responses")
+            response_records = [
+                endpoint,
+                *(
+                    response
+                    for response in responses
+                    if isinstance(response, dict)
+                )
+            ] if isinstance(responses, list) else [endpoint]
+            for response in response_records:
+                if not isinstance(response, dict):
+                    continue
+                status = response.get("sc") or response.get("status_code")
+                if status != 405:
+                    continue
+                headers = response.get("headers") or endpoint.get("headers") or {}
+                allow = (
+                    response.get("allow")
+                    or response.get("allow_header")
+                    or endpoint.get("allow")
+                    or endpoint.get("allow_header")
+                )
+                if not allow and isinstance(headers, dict):
+                    allow = headers.get("allow") or headers.get("Allow")
+                if not isinstance(allow, str):
+                    continue
+                allow_methods_by_path.setdefault(path.rstrip("/") or "/", set()).update(
+                    method.strip().upper()
+                    for method in allow.split(",")
+                    if re.fullmatch(r"\s*[A-Za-z]+\s*", method)
+                )
+                method_evidence_count += 1
+
         candidates = []
+        exclusions = []
         for index, endpoint in enumerate(discovered_endpoints or []):
             if not isinstance(endpoint, dict):
                 continue
             method = str(endpoint.get("method") or "").upper()
-            path = endpoint.get("path")
+            path = endpoint.get("path") or endpoint.get("discovered_path")
+            path_text = (
+                re.sub(r"[\r\n\t]", " ", path.split("?", 1)[0].split("#", 1)[0])[:200]
+                if isinstance(path, str)
+                else "[missing path]"
+            )
+            segments = (
+                cls._path_segments(path)
+                if isinstance(path, str) and path.startswith("/")
+                else []
+            )
+            route_looks_auth_related = bool(
+                set(segments)
+                & {
+                    "login", "signin", "sign-in", "sign_in", "authenticate",
+                    "token", "register", "registration", "signup", "sign-up",
+                    "session", "logout", "refresh",
+                }
+            )
             if method != "POST" or not isinstance(path, str) or not path.startswith("/"):
+                if route_looks_auth_related:
+                    exclusions.append(
+                        (method or "UNKNOWN", path_text, "Only an observed POST can be a login candidate.")
+                    )
                 continue
             parsed = urlsplit(path)
             if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+                exclusions.append(
+                    (method, path_text, "Login candidate path must be a relative route without query data.")
+                )
                 continue
-            if not cls.is_authentication_path(path):
-                continue
-            if any(
+            if not segments or any(
                 segment in cls.REGISTRATION_PATH_SEGMENTS
-                for segment in cls._path_segments(path)
+                | cls.NON_LOGIN_AUTH_PATH_SEGMENTS
+                for segment in segments
             ):
+                if route_looks_auth_related:
+                    exclusions.append(
+                        (method, path_text, "Registration or non-login authentication route.")
+                    )
+                continue
+            login_terms = {"login", "signin", "sign-in", "sign_in", "authenticate"}
+            token_login = "token" in segments and bool(
+                {"auth", "session"} & set(segments)
+            )
+            if not (set(segments) & login_terms or token_login):
+                if route_looks_auth_related:
+                    exclusions.append(
+                        (method, path_text, "Route lacks login/token endpoint evidence.")
+                    )
                 continue
 
             status = None
@@ -253,22 +356,90 @@ class EndpointSelector:
                     )
                     if status is not None or response_content_type:
                         break
+            sources = endpoint.get("discovery_sources") or endpoint.get("sources") or []
+            evidence = endpoint.get("discovery_evidence") or endpoint.get("evidence") or []
+            source_names = [
+                source for source in sources if isinstance(source, str)
+            ] if isinstance(sources, list) else []
+            evidence_snippets = [
+                entry["snippet"][:500]
+                for entry in evidence
+                if isinstance(entry, dict) and isinstance(entry.get("snippet"), str)
+            ] if isinstance(evidence, list) else []
+            raw_body_fields = endpoint.get("request_body_fields")
+            request_body_fields = (
+                [
+                    field
+                    for field in raw_body_fields
+                    if isinstance(field, str)
+                    and re.fullmatch(r"[A-Za-z_$][\w$]*", field)
+                ]
+                if isinstance(raw_body_fields, list)
+                else []
+            )
+            request_content_type = endpoint.get("request_content_type")
+            request_format_evidence = bool(
+                request_body_fields
+                and request_content_type in {
+                    "application/json",
+                    "application/x-www-form-urlencoded",
+                    "multipart/form-data",
+                }
+            )
+            path_allow_methods = allow_methods_by_path.get(path.rstrip("/") or "/", set())
+            rank = (
+                0 if set(segments) & {"login", "signin", "sign-in", "sign_in"} else 1,
+                0 if request_format_evidence else 1,
+                0 if status in {200, 201, 202, 400, 401, 403} else 1,
+            )
             candidates.append(
                 {
                     "method": method,
                     "path": path,
                     "discovery_status": status,
                     "response_content_type": response_content_type,
+                    "evidence_source": source_names or ["discovery"],
+                    "evidence": evidence_snippets,
+                    "request_body_fields": request_body_fields,
+                    "request_content_type": request_content_type,
+                    "request_content_type_evidence": endpoint.get(
+                        "request_content_type_evidence"
+                    ),
+                    "request_format_evidence": request_format_evidence,
+                    "allow_header_methods": sorted(path_allow_methods),
+                    "_rank": rank,
                     "_index": index,
                 }
             )
 
         candidates.sort(
-            key=lambda candidate: (
-                0 if candidate["discovery_status"] in {200, 201, 202} else 1,
-                candidate["_index"],
-            )
+            key=lambda candidate: (*candidate["_rank"], candidate["_index"])
         )
         for candidate in candidates:
+            candidate.pop("_rank", None)
             candidate.pop("_index", None)
+        logger.info(
+            "Login candidate selection | inventory_records=%d | candidates=%d | "
+            "excluded_auth_routes=%d | allow_method_observations=%d",
+            len(discovered_endpoints or []),
+            len(candidates),
+            len(exclusions),
+            method_evidence_count,
+        )
+        for method, path, reason in exclusions:
+            logger.info(
+                "Login candidate excluded | method=%s | route=%s | reason=%s",
+                method,
+                path,
+                reason,
+            )
+        for candidate in candidates:
+            logger.info(
+                "Login candidate retained | method=%s | route=%s | source=%s | "
+                "request_contract=%s",
+                candidate["method"],
+                candidate["path"],
+                ",".join(candidate.get("evidence_source", [])),
+                candidate.get("request_format_evidence", False),
+            )
         return candidates

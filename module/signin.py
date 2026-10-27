@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -8,6 +9,9 @@ import httpx
 from dotenv import load_dotenv
 
 from module.endpoint_selection import EndpointSelector
+
+
+logger = logging.getLogger(__name__)
 
 
 class LoginError(Exception):
@@ -22,7 +26,10 @@ class LoginConfigurationError(LoginError):
 
 class Signin:
     TIMEOUT_SECONDS = 8
+    MAX_LOGIN_CANDIDATES = 3
     TOKEN_FIELDS = ("access_token", "accessToken", "token", "jwt")
+    USERNAME_FIELDS = {"email", "login", "user", "username"}
+    PASSWORD_FIELDS = {"pass", "passwd", "password"}
     ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
     @staticmethod
@@ -90,6 +97,54 @@ class Signin:
         return False
 
     @classmethod
+    def _credential_payloads(cls, username, password, candidates):
+        payloads = {}
+        for candidate in candidates:
+            fields = candidate.get("request_body_fields")
+            content_type = candidate.get("request_content_type")
+            if (
+                not candidate.get("request_format_evidence")
+                or not isinstance(fields, list)
+                or content_type
+                not in {
+                    "application/json",
+                    "application/x-www-form-urlencoded",
+                    "multipart/form-data",
+                }
+            ):
+                continue
+            username_key = next(
+                (
+                    field
+                    for field in fields
+                    if isinstance(field, str) and field.lower() in cls.USERNAME_FIELDS
+                ),
+                None,
+            )
+            password_key = next(
+                (
+                    field
+                    for field in fields
+                    if isinstance(field, str) and field.lower() in cls.PASSWORD_FIELDS
+                ),
+                None,
+            )
+            if (
+                not username_key
+                or not password_key
+                or any(
+                    field not in {username_key, password_key}
+                    for field in fields
+                )
+            ):
+                continue
+            payloads[candidate["path"]] = {
+                "payload": {username_key: username, password_key: password},
+                "content_type": content_type,
+            }
+        return payloads
+
+    @classmethod
     def configured_auth(cls, discovered_endpoints):
         cls.load_environment()
         config = cls._parse_json_env("MICROSCAN_AUTH_CONFIG")
@@ -97,29 +152,49 @@ class Signin:
         candidates = cls.discover_login_candidates(discovered_endpoints)
         username = os.environ.get("MICROSHIELD_USERNAME", "").strip()
         password = os.environ.get("MICROSHIELD_PASSWORD", "")
+        candidate_configurations = (
+            cls._credential_payloads(username, password, candidates)
+            if config is None
+            and legacy_payload is None
+            and username
+            and password.strip()
+            else {}
+        )
+        logger.info(
+            "Login configuration evaluated | candidates=%d | "
+            "evidence_supported_contracts=%d | credentials_configured=%s",
+            len(candidates),
+            len(candidate_configurations),
+            bool(username and password.strip()),
+        )
         credential_payload = (
-            {"username": username, "password": password}
-            if username and password.strip()
+            next(iter(candidate_configurations.values()))["payload"]
+            if candidate_configurations
             else None
         )
 
         if config is None and legacy_payload is None and credential_payload is None:
-            if username or password:
+            if username and password.strip():
+                note = (
+                    "Credentials are configured, but no discovered login candidate has a "
+                    "complete evidence-supported request format. No credentials were sent."
+                )
+            elif username or password:
                 note = (
                     "Authenticated coverage is unavailable because both "
                     "MICROSHIELD_USERNAME and MICROSHIELD_PASSWORD must be configured."
                 )
             elif candidates:
                 note = (
-                    "A login endpoint was discovered, but its request schema and credentials are "
-                    "unknown. Unauthenticated checks ran; configure MICROSHIELD_USERNAME and "
-                    "MICROSHIELD_PASSWORD, MICROSCAN_LOGIN_PAYLOAD, or MICROSCAN_AUTH_CONFIG."
+                    "A login route was discovered, but no evidence-supported request format and "
+                    "complete credential pair are available. No login request was sent."
                 )
             else:
                 note = (
-                    "No user-provided login configuration or discovered login endpoint is "
-                    "available; unauthenticated checks ran, but valid-token coverage is unavailable. "
-                    "Configure MICROSHIELD_USERNAME and MICROSHIELD_PASSWORD or a login payload."
+                    "No login endpoint was found in authorized Discovery evidence; no login request "
+                    "was sent and valid-token coverage is unavailable. Configure "
+                    "MICROSHIELD_USERNAME and MICROSHIELD_PASSWORD after login request evidence "
+                    "is discovered."
                 )
             return None, candidates, note
         if config is None:
@@ -134,27 +209,67 @@ class Signin:
         login_endpoint = config.get("login_endpoint") or os.environ.get(
             "MICROSCAN_LOGIN_ENDPOINT"
         )
+        automatic_credentials = (
+            legacy_payload is None
+            and credential_payload is not None
+            and config.get("login_endpoint") is None
+        )
+        if not login_endpoint and candidate_configurations:
+            login_endpoint = next(iter(candidate_configurations))
+        try:
+            login_route_path = (
+                urlsplit(login_endpoint).path
+                if isinstance(login_endpoint, str)
+                and (urlsplit(login_endpoint).scheme or urlsplit(login_endpoint).netloc)
+                else login_endpoint
+            )
+        except ValueError:
+            login_route_path = None
+        if (
+            automatic_credentials
+            and login_endpoint
+            and login_route_path not in candidate_configurations
+        ):
+            return None, candidates, (
+                "Configured login route has no matching authorized Discovery request "
+                "evidence; credentials were not sent."
+            )
         if not login_endpoint and candidates:
             login_endpoint = candidates[0]["path"]
         if not login_endpoint:
             return None, candidates, (
-                "Login configuration is present, but no login endpoint was discovered; "
-                "set login_endpoint in MICROSCAN_AUTH_CONFIG or MICROSCAN_LOGIN_ENDPOINT."
+                "Login configuration is present, but no eligible POST login endpoint was "
+                "found in authorized Discovery evidence."
             )
         if not isinstance(login_endpoint, str):
             raise LoginConfigurationError(
                 "Configured login_endpoint must be a path or target-origin URL."
             )
 
+        inferred_content_type = (
+            candidate_configurations.get(login_route_path, {}).get("content_type")
+            or next(
+                (
+                    candidate.get("request_content_type")
+                    for candidate in candidates
+                    if candidate["path"] == login_route_path
+                    and candidate.get("request_format_evidence")
+                ),
+                None,
+            )
+        )
         content_type = str(
-            config.get("content_type", "application/json")
+            config.get("content_type")
+            or inferred_content_type
+            or ("application/json" if legacy_payload or config is not None else "")
         ).split(";", 1)[0].strip().lower()
         if content_type not in {
             "application/json",
             "application/x-www-form-urlencoded",
+            "multipart/form-data",
         }:
             raise LoginConfigurationError(
-                "Configured login content_type must be application/json or application/x-www-form-urlencoded."
+                "Configured login content_type must be JSON, URL-encoded, or multipart form data."
             )
         auth_header = config.get("auth_header", "Authorization")
         if not isinstance(auth_header, str) or not re.fullmatch(
@@ -176,6 +291,11 @@ class Signin:
             "token_field": config.get("token_field"),
             "auth_header": auth_header,
             "auth_scheme": auth_scheme,
+            "explicit_login_endpoint": bool(
+                config.get("login_endpoint")
+                or os.environ.get("MICROSCAN_LOGIN_ENDPOINT")
+            ),
+            "_candidate_configurations": candidate_configurations,
         }, candidates, None
 
     @classmethod
@@ -196,13 +316,27 @@ class Signin:
                 if isinstance(value, str) and value.strip():
                     return value.strip()
 
-        for container in containers:
+        pending = list(containers)
+        visited = set()
+        while pending:
+            container = pending.pop(0)
             if not isinstance(container, dict):
                 continue
+            identity = id(container)
+            if identity in visited:
+                continue
+            visited.add(identity)
             for key in cls.TOKEN_FIELDS:
                 value = container.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
+            pending.extend(
+                [
+                    value
+                    for value in container.values()
+                    if isinstance(value, dict)
+                ][: max(0, 32 - len(visited) - len(pending))]
+            )
         return None
 
     @staticmethod
@@ -210,12 +344,26 @@ class Signin:
         containers = [data]
         if isinstance(data, dict):
             containers.extend((data.get("data"), data.get("result")))
-        for container in containers:
+        pending = list(containers)
+        visited = set()
+        while pending:
+            container = pending.pop(0)
             if not isinstance(container, dict):
                 continue
+            identity = id(container)
+            if identity in visited:
+                continue
+            visited.add(identity)
             value = container.get("token_type") or container.get("tokenType")
             if isinstance(value, str) and value.strip():
                 return value.strip()
+            pending.extend(
+                [
+                    nested
+                    for nested in container.values()
+                    if isinstance(nested, dict)
+                ][: max(0, 32 - len(visited) - len(pending))]
+            )
         return None
 
     @staticmethod
@@ -261,6 +409,13 @@ class Signin:
             raise LoginConfigurationError(
                 "Login endpoint must not contain query or fragment data."
             )
+        if any(
+            segment.lower() in EndpointSelector.REGISTRATION_PATH_SEGMENTS
+            for segment in parsed_path.path.split("/")
+        ):
+            raise LoginConfigurationError(
+                "Registration endpoints cannot be used for login."
+            )
         return urlunsplit((base.scheme, base.netloc, parsed_path.path, "", ""))
 
     def signin(self, target, configuration):
@@ -270,6 +425,8 @@ class Signin:
         method = str(configuration.get("method", "POST")).upper()
         if method != "POST":
             raise LoginConfigurationError("Only POST login requests are supported.")
+        route = urlsplit(login_url).path
+        logger.info("Login executor invoked | method=%s | route=%s", method, route)
 
         payload = configuration.get("payload")
         if not isinstance(payload, dict) or not payload:
@@ -279,9 +436,15 @@ class Signin:
         headers = {"Content-Type": content_type}
         request_kwargs = {"headers": headers}
         if content_type == "application/json":
+            request_kwargs["headers"] = headers
             request_kwargs["json"] = payload
         elif content_type == "application/x-www-form-urlencoded":
+            request_kwargs["headers"] = headers
             request_kwargs["content"] = urlencode(payload)
+        elif content_type == "multipart/form-data":
+            request_kwargs["files"] = {
+                key: (None, str(value)) for key, value in payload.items()
+            }
         else:
             raise LoginConfigurationError("Unsupported login content type.")
 
@@ -298,45 +461,95 @@ class Signin:
             raise LoginError("Login request could not reach the configured target.") from exc
 
         if not 200 <= response.status_code < 300:
+            logger.info(
+                "Login executor response | method=%s | route=%s | http_status=%d | "
+                "token_detected=false | session_detected=false",
+                method,
+                route,
+                response.status_code,
+            )
             raise LoginError(
                 f"Login endpoint returned HTTP {response.status_code}.",
                 status_code=response.status_code,
             )
         try:
             data = response.json()
-        except ValueError as exc:
-            raise LoginError(
-                "Login endpoint returned invalid JSON.",
-                status_code=response.status_code,
-            ) from exc
+        except ValueError:
+            data = None
 
         if self._login_response_failed(data):
+            logger.info(
+                "Login executor response | method=%s | route=%s | http_status=%d | "
+                "token_detected=false | session_detected=false",
+                method,
+                route,
+                response.status_code,
+            )
             raise LoginError(
                 "Login endpoint reported an unsuccessful authentication response.",
                 status_code=response.status_code,
             )
 
         token = self.extract_token(data, configuration.get("token_field"))
-        if not token:
+        cookies = [
+            f"{cookie.name}={cookie.value}"
+            for cookie in response.cookies.jar
+            if cookie.name and cookie.value
+        ]
+        if data is None and not cookies:
+            logger.info(
+                "Login executor response | method=%s | route=%s | http_status=%d | "
+                "token_detected=false | session_detected=false",
+                method,
+                route,
+                response.status_code,
+            )
             raise LoginError(
-                "Login response did not contain a supported access-token field.",
+                "Login response contained invalid JSON and did not contain a session cookie.",
+                status_code=response.status_code,
+            )
+        if not token and not cookies:
+            logger.info(
+                "Login executor response | method=%s | route=%s | http_status=%d | "
+                "token_detected=false | session_detected=false",
+                method,
+                route,
+                response.status_code,
+            )
+            raise LoginError(
+                "Login response did not contain a supported access token or session cookie.",
                 status_code=response.status_code,
             )
 
-        token_type = self.token_type(data)
+        token_type = self.token_type(data) if token else None
         configured_scheme = configuration.get("auth_scheme")
         scheme = str(configured_scheme or token_type or "").strip()
-        jwt_format = len(token.split(".")) == 3 and all(token.split("."))
+        jwt_format = bool(token and len(token.split(".")) == 3 and all(token.split(".")))
         defaulted_bearer_scheme = not scheme and jwt_format
         if defaulted_bearer_scheme:
             scheme = "Bearer"
         if scheme and not re.fullmatch(r"[A-Za-z0-9._-]+", scheme):
             raise LoginConfigurationError("Configured or observed auth scheme is invalid.")
-        mechanism = self.token_mechanism(token, token_type)
+        mechanism = (
+            self.token_mechanism(token, token_type)
+            if token
+            else "cookie-based session"
+        )
         if defaulted_bearer_scheme:
             mechanism = "JWT over Bearer (inferred from JWT format)"
+        logger.info(
+            "Login executor response | method=%s | route=%s | http_status=%d | "
+            "token_detected=%s | session_detected=%s",
+            method,
+            route,
+            response.status_code,
+            bool(token),
+            bool(cookies),
+        )
         return {
             "token": token,
+            "cookie": "; ".join(cookies) if cookies else None,
+            "credential_type": "token" if token else "cookie",
             "auth_header": str(configuration.get("auth_header", "Authorization")),
             "auth_scheme": scheme or None,
             "auth_scheme_source": (

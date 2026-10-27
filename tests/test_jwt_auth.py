@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -16,6 +16,7 @@ from module.pentest_report import build_pentest_report
 from module.signin import LoginConfigurationError, LoginError, Signin
 
 Signin.ENV_FILE = Path(__file__).with_name(".test-env-absent")
+GATEWAY = "http://127.0.0.1:8085"
 
 
 def response(status_code, body, headers=None):
@@ -36,6 +37,10 @@ class SigninTests(unittest.TestCase):
         self.assertEqual(
             Signin.extract_token({"data": {"token": "def"}}),
             "def",
+        )
+        self.assertEqual(
+            Signin.extract_token({"data": {"tokens": {"access_token": "nested"}}}),
+            "nested",
         )
         self.assertIsNone(Signin.extract_token({"message": "logged in"}))
         self.assertIsNone(Signin.extract_token(["not", "an", "object"]))
@@ -82,7 +87,15 @@ class SigninTests(unittest.TestCase):
     )
     def test_username_and_password_environment_create_login_payload(self):
         discovered = [
-            {"method": "POST", "path": "/api/auth/login", "responses": [{"sc": 200}]}
+            {
+                "method": "POST",
+                "path": "/api/auth/login",
+                "sources": ["javascript"],
+                "request_body_fields": ["username", "password"],
+                "request_content_type": "application/json",
+                "request_content_type_evidence": "shared_api_helper",
+                "responses": [{"sc": 200}],
+            }
         ]
 
         config, candidates, note = Signin.configured_auth(discovered)
@@ -93,6 +106,7 @@ class SigninTests(unittest.TestCase):
         )
         self.assertEqual(config["login_endpoint"], "/api/auth/login")
         self.assertEqual(candidates[0]["path"], "/api/auth/login")
+        self.assertEqual(config["content_type"], "application/json")
         self.assertIsNone(note)
 
     @patch.dict(
@@ -225,7 +239,229 @@ class SigninTests(unittest.TestCase):
         self.assertIsNone(config)
         self.assertEqual(candidates[0]["path"], "/v2/session/token")
         self.assertEqual(configured_candidates, candidates)
-        self.assertIn("request schema and credentials are unknown", note)
+        self.assertIn("evidence-supported request format", note)
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "lab-user",
+            "MICROSHIELD_PASSWORD": "lab-password",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    def test_frontend_login_evidence_infers_post_route_and_email_payload(self, _load):
+        discovered = [
+            {
+                "method": "POST",
+                "path": "/api/auth/login",
+                "sources": ["javascript"],
+                "request_body_fields": ["email", "password"],
+                "request_content_type": "application/json",
+                "request_content_type_evidence": "javascript_request",
+                "evidence": [
+                    {
+                        "snippet": (
+                            "fetch('/api/auth/login', {method:'POST', "
+                            "body: JSON.stringify({email, password})})"
+                        )
+                    }
+                ],
+            }
+        ]
+
+        config, candidates, note = Signin.configured_auth(discovered)
+
+        self.assertEqual(config["login_endpoint"], "/api/auth/login")
+        self.assertEqual(config["method"], "POST")
+        self.assertEqual(
+            config["payload"],
+            {"email": "lab-user", "password": "lab-password"},
+        )
+        self.assertEqual(candidates[0]["evidence_source"], ["javascript"])
+        self.assertIsNone(note)
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "private-user",
+            "MICROSHIELD_PASSWORD": "private-password",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    @patch("module.signin.httpx.post")
+    def test_auto_login_executes_exact_evidence_supported_json_request(
+        self, post, _load
+    ):
+        post.return_value = httpx.Response(
+            200,
+            json={"token": "actual-test-token"},
+            request=httpx.Request("POST", f"{GATEWAY}/api/auth/login"),
+        )
+        config, candidates, note = Signin.configured_auth(
+            [
+                {
+                    "method": "POST",
+                    "path": "/api/auth/login",
+                    "sources": ["javascript"],
+                    "request_body_fields": ["username", "password"],
+                    "request_content_type": "application/json",
+                    "request_content_type_evidence": "shared_api_helper",
+                }
+            ]
+        )
+
+        login = Signin().signin(GATEWAY, config)
+
+        self.assertIsNone(note)
+        self.assertEqual(login["token"], "actual-test-token")
+        self.assertEqual(post.call_args.args[0], f"{GATEWAY}/api/auth/login")
+        self.assertEqual(post.call_args.kwargs["json"], {
+            "username": "private-user",
+            "password": "private-password",
+        })
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Content-Type"],
+            "application/json",
+        )
+        self.assertNotIn("private-user", json.dumps(candidates))
+        self.assertNotIn("private-password", json.dumps(candidates))
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "lab-user",
+            "MICROSHIELD_PASSWORD": "lab-password",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    def test_credentials_are_not_sent_without_request_contract(self, _load):
+        config, candidates, note = Signin.configured_auth(
+            [{"method": "POST", "path": "/api/auth/login", "sources": ["javascript"]}]
+        )
+
+        self.assertIsNone(config)
+        self.assertEqual(candidates[0]["path"], "/api/auth/login")
+        self.assertIn("evidence-supported request format", note)
+
+    def test_get_405_allow_post_enriches_observed_post_candidate(self):
+        candidates = EndpointSelector.discover_login_candidates(
+            [
+                {
+                    "method": "GET",
+                    "path": "/api/auth/login",
+                    "status_code": 405,
+                    "allow": "POST",
+                    "sources": ["kiterunner"],
+                },
+                {
+                    "method": "POST",
+                    "path": "/api/auth/login",
+                    "sources": ["javascript"],
+                    "request_body_fields": ["username", "password"],
+                    "request_content_type": "application/json",
+                    "request_content_type_evidence": "shared_api_helper",
+                },
+                {
+                    "method": "POST",
+                    "path": "/api/auth/register",
+                    "sources": ["javascript"],
+                    "request_body_fields": ["username", "password"],
+                    "request_content_type": "application/json",
+                },
+            ]
+        )
+
+        self.assertEqual([candidate["path"] for candidate in candidates], ["/api/auth/login"])
+        self.assertEqual(candidates[0]["method"], "POST")
+        self.assertEqual(candidates[0]["allow_header_methods"], ["POST"])
+
+    def test_405_without_allow_does_not_invent_login_method(self):
+        candidates = EndpointSelector.discover_login_candidates(
+            [
+                {
+                    "method": "GET",
+                    "path": "/api/auth/login",
+                    "status_code": 405,
+                    "sources": ["kiterunner"],
+                }
+            ]
+        )
+
+        self.assertEqual(candidates, [])
+
+    @patch("module.signin.httpx.post")
+    def test_cookie_only_login_result_is_supported(self, post):
+        post.return_value = httpx.Response(
+            200,
+            content=b"Signed in",
+            headers={"set-cookie": "sessionid=private-session; Path=/; HttpOnly"},
+            request=httpx.Request("POST", "http://127.0.0.1:8085/api/auth/login"),
+        )
+
+        login = Signin().signin(
+            "127.0.0.1:8085",
+            {
+                "login_endpoint": "/api/auth/login",
+                "payload": {"username": "lab-user", "password": "lab-password"},
+            },
+        )
+
+        self.assertIsNone(login["token"])
+        self.assertEqual(login["credential_type"], "cookie")
+        self.assertIn("sessionid=private-session", login["cookie"])
+        self.assertEqual(login["mechanism"], "cookie-based session")
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "lab-user",
+            "MICROSHIELD_PASSWORD": "lab-password",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    def test_formdata_evidence_selects_multipart_content_type(self, _load):
+        config, _, _ = Signin.configured_auth(
+            [
+                {
+                    "method": "POST",
+                    "path": "/api/auth/login",
+                    "sources": ["javascript"],
+                    "request_body_fields": ["username", "password"],
+                    "request_content_type": "multipart/form-data",
+                    "request_content_type_evidence": "javascript_request",
+                }
+            ]
+        )
+
+        self.assertEqual(config["content_type"], "multipart/form-data")
+
+    def test_login_candidate_selection_excludes_register_and_session_checks(self):
+        candidates = EndpointSelector.discover_login_candidates(
+            [
+                {"method": "POST", "path": "/api/auth/register"},
+                {"method": "GET", "path": "/api/auth/session"},
+                {"method": "POST", "path": "/api/auth/login"},
+            ]
+        )
+
+        self.assertEqual([candidate["path"] for candidate in candidates], ["/api/auth/login"])
+
+    @patch("module.signin.httpx.post")
+    def test_login_executor_never_posts_credentials_to_registration_route(self, post):
+        with self.assertRaisesRegex(LoginConfigurationError, "Registration endpoints"):
+            Signin().signin(
+                GATEWAY,
+                {
+                    "login_endpoint": "/api/auth/register",
+                    "payload": {"username": "private-user", "password": "private-pass"},
+                },
+            )
+
+        post.assert_not_called()
 
     @patch("module.signin.httpx.post")
     def test_login_rejects_http_failure_without_echoing_body(self, post):
@@ -329,6 +565,235 @@ class AuthenticationTestTests(unittest.TestCase):
         )
         self.environment.start()
         self.addCleanup(self.environment.stop)
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "lab-user",
+            "MICROSHIELD_PASSWORD": "private-password",
+            "MICROSCAN_JWT_ENDPOINT_ALLOWLIST": "[]",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    @patch("module.signin.httpx.post")
+    def test_login_token_is_used_and_secrets_do_not_enter_endpoint_report(
+        self, post, _load
+    ):
+        jwt = "header.payload.private-token"
+        post.return_value = httpx.Response(
+            200,
+            json={"access_token": jwt, "token_type": "Bearer"},
+            request=httpx.Request("POST", "http://127.0.0.1:8085/api/auth/login"),
+        )
+        selected = {
+            "endpoint": {"method": "GET", "path": "/api/orders"},
+            "path": "/api/orders",
+            "method": "GET",
+            "reason": "selected test route",
+        }
+        inventory = [
+            {
+                "method": "POST",
+                "path": "/api/auth/login",
+                "sources": ["javascript"],
+                "request_body_fields": ["username", "password"],
+                "request_content_type": "application/json",
+                "request_content_type_evidence": "javascript_request",
+                "evidence": [
+                    {
+                        "snippet": (
+                            "fetch('/api/auth/login', {method:'POST', "
+                            "body: JSON.stringify({username, password})})"
+                        )
+                    }
+                ],
+            }
+        ]
+        self.authentication_test.reset_scan_state()
+        with patch.object(
+            self.authentication_test,
+            "_run_http_request",
+            side_effect=[
+                response(401, {"error": "Unauthorized"}),
+                response(401, {"error": "Invalid token"}),
+                response(200, {"orders": [{"id": 1, "total": 10}]}),
+            ],
+        ) as request:
+            result = self.authentication_test.evaluate(
+                "http://127.0.0.1:8085",
+                selected,
+                discovered_endpoints=inventory,
+            )
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(request.call_args.kwargs["headers"]["Authorization"], f"Bearer {jwt}")
+        self.assertIn(
+            AuthenticationTest.INVALID_TOKEN,
+            request.call_args_list[1].kwargs["headers"]["Authorization"],
+        )
+        self.assertEqual(result["discovery"]["selected_login_route"], "/api/auth/login")
+        self.assertEqual(result["discovery"]["login_attempt_status"], "succeeded")
+        self.assertEqual(result["discovery"]["authentication_result"], "success")
+        self.assertTrue(result["discovery"]["token_or_session_detected"])
+        self.assertNotIn(jwt, json.dumps(result))
+        self.assertNotIn("private-password", json.dumps(result))
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "lab-user",
+            "MICROSHIELD_PASSWORD": "private-password",
+            "MICROSCAN_JWT_ENDPOINT_ALLOWLIST": "[]",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    @patch("module.signin.httpx.post")
+    def test_login_401_skips_valid_token_with_candidate_reason(self, post, _load):
+        post.return_value = httpx.Response(
+            401,
+            json={"error": "invalid credentials"},
+            request=httpx.Request("POST", "http://127.0.0.1:8085/api/auth/login"),
+        )
+        selected = {
+            "endpoint": {"method": "GET", "path": "/api/orders"},
+            "path": "/api/orders",
+            "method": "GET",
+            "reason": "selected test route",
+        }
+        inventory = [
+            {
+                "method": "POST",
+                "path": "/api/auth/login",
+                "sources": ["javascript"],
+                "request_body_fields": ["username", "password"],
+                "request_content_type": "application/json",
+                "request_content_type_evidence": "javascript_request",
+            }
+        ]
+        with patch.object(
+            self.authentication_test,
+            "_run_http_request",
+            side_effect=[
+                response(401, {"error": "Unauthorized"}),
+                response(401, {"error": "Invalid token"}),
+            ],
+        ) as request:
+            result = self.authentication_test.evaluate(
+                "http://127.0.0.1:8085",
+                selected,
+                discovered_endpoints=inventory,
+            )
+
+        valid_case = next(
+            case for case in result["test_cases"] if case["test_case"] == "valid_token"
+        )
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(valid_case["status"], "skipped")
+        self.assertIn("/api/auth/login", valid_case["reason"])
+        self.assertIn("HTTP 401", valid_case["reason"])
+        self.assertEqual(result["discovery"]["authentication_result"], "failed")
+        self.assertEqual(result["discovery"]["selected_login_route"], "/api/auth/login")
+        self.assertEqual(result["discovery"]["selected_login_method"], "POST")
+        self.assertEqual(result["discovery"]["login_attempt_status"], "failed")
+        self.assertNotIn("private-password", json.dumps(result))
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "lab-user",
+            "MICROSHIELD_PASSWORD": "private-password",
+            "MICROSCAN_JWT_ENDPOINT_ALLOWLIST": "[]",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    @patch("module.signin.httpx.post")
+    def test_cookie_session_is_used_for_valid_token_case(self, post, _load):
+        post.return_value = httpx.Response(
+            200,
+            content=b"Signed in",
+            headers={"set-cookie": "sessionid=private-session; Path=/; HttpOnly"},
+            request=httpx.Request("POST", "http://127.0.0.1:8085/api/auth/login"),
+        )
+        selected = {
+            "endpoint": {"method": "GET", "path": "/api/orders"},
+            "path": "/api/orders",
+            "method": "GET",
+            "reason": "selected test route",
+        }
+        inventory = [
+            {
+                "method": "POST",
+                "path": "/api/auth/login",
+                "sources": ["javascript"],
+                "request_body_fields": ["username", "password"],
+                "request_content_type": "application/json",
+                "request_content_type_evidence": "javascript_request",
+            }
+        ]
+        with patch.object(
+            self.authentication_test,
+            "_run_http_request",
+            side_effect=[
+                response(401, {"error": "Unauthorized"}),
+                response(401, {"error": "Invalid token"}),
+                response(200, {"orders": [{"id": 1, "total": 10}]}),
+            ],
+        ) as request:
+            result = self.authentication_test.evaluate(
+                "http://127.0.0.1:8085",
+                selected,
+                discovered_endpoints=inventory,
+            )
+
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(request.call_args.kwargs["headers"], {"Cookie": "sessionid=private-session"})
+        self.assertEqual(result["discovery"]["authentication_mechanism"], "cookie-based session")
+        self.assertNotIn("private-session", json.dumps(result))
+        self.assertNotIn("private-password", json.dumps(result))
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "lab-user",
+            "MICROSHIELD_PASSWORD": "private-password",
+            "MICROSCAN_JWT_ENDPOINT_ALLOWLIST": "[]",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    @patch("module.signin.httpx.post")
+    def test_no_common_login_route_is_guessed_when_discovery_has_no_candidate(
+        self, post, _load
+    ):
+        selected = {
+            "endpoint": {"method": "GET", "path": "/api/orders"},
+            "path": "/api/orders",
+            "method": "GET",
+            "reason": "selected test route",
+        }
+        with patch.object(
+            self.authentication_test,
+            "_run_http_request",
+            side_effect=[response(401, {}), response(401, {})],
+        ):
+            result = self.authentication_test.evaluate(
+                "http://127.0.0.1:8085",
+                selected,
+                discovered_endpoints=[],
+            )
+
+        post.assert_not_called()
+        self.assertEqual(result["discovery"]["login_discovery_status"], "not_found")
+        self.assertEqual(result["discovery"]["login_attempt_status"], "unavailable")
+        valid_case = next(
+            case for case in result["test_cases"] if case["test_case"] == "valid_token"
+        )
+        self.assertEqual(valid_case["status"], "skipped")
 
     def evaluate_missing_token_body(self, body, authentication_required=None):
         candidate_endpoint = {
@@ -2133,10 +2598,10 @@ class AuthenticationTestTests(unittest.TestCase):
             AuthenticationTest.TIMEOUT_SECONDS,
         )
 
-    def test_non_auth_modules_are_not_advertised(self):
+    def test_resource_routes_advertise_passive_bola_not_jwt_module(self):
         self.assertEqual(
             self.modules.classify_endpoint({"path": "/api/users/42"})["applicable_tests"],
-            [],
+            [EndpointSelector.BOLA_MODULE],
         )
 
 
@@ -2627,9 +3092,19 @@ class PentestReportTests(unittest.TestCase):
 
 
 class ScanContractTests(unittest.TestCase):
+    def setUp(self):
+        self.file_discovery_patcher = patch(
+            "app.main.FileDiscovery.scan",
+            new_callable=AsyncMock,
+            return_value={"results": [], "summary": {}},
+        )
+        self.file_discovery = self.file_discovery_patcher.start()
+        self.addCleanup(self.file_discovery_patcher.stop)
+
     def test_discovery_failure_returns_scan_failed_pentest_summary(self):
         from fastapi.testclient import TestClient
 
+        self.file_discovery.side_effect = RuntimeError("File Discovery failed.")
         with patch(
             "app.main.Discovery.discover",
             side_effect=RuntimeError("Kiterunner failed."),
@@ -2676,11 +3151,12 @@ class ScanContractTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200)
         payload = result.json()
         self.assertEqual(request.call_count, 2)
-        self.assertEqual(payload["summary"]["discovered_endpoints"], 3)
+        self.assertEqual(payload["summary"]["discovered_endpoints"], 2)
         self.assertEqual(payload["summary"]["selected_endpoints"], 1)
         self.assertEqual(payload["summary"]["tested_endpoints"], 1)
         self.assertEqual(payload["summary"]["test_cases_run"], 2)
-        self.assertEqual(payload["summary"]["skipped_endpoints"], 2)
+        self.assertEqual(payload["summary"]["skipped_endpoints"], 1)
+        self.assertEqual(payload["summary"]["jwt_unsupported_method_endpoints"], 1)
         self.assertEqual(payload["summary"]["jwt_selection_mode"], "automatic_local_lab")
         self.assertEqual(
             {result["status"] for result in payload["test_results"]},
@@ -2720,12 +3196,12 @@ class ScanContractTests(unittest.TestCase):
 
         self.assertEqual(result.status_code, 200)
         summary = result.json()["summary"]
-        self.assertEqual(summary["discovered_endpoints"], 2)
+        self.assertEqual(summary["discovered_endpoints"], 1)
         self.assertEqual(summary["tested_endpoints"], 1)
-        self.assertEqual(summary["untested_endpoints"], 1)
+        self.assertEqual(summary["untested_endpoints"], 0)
         self.assertEqual(summary["test_cases_run"], 2)
         self.assertEqual(summary["potential_findings"], 0)
-        self.assertEqual(summary["skipped_tests"], 5)
+        self.assertEqual(summary["skipped_tests"], 1)
         self.assertEqual(summary["not_implemented_test_cases"], 1)
         self.assertEqual(summary["inconclusive_tests"], 0)
         self.assertTrue(summary["jwt_allowlist_configured"])
@@ -2759,8 +3235,9 @@ class ScanContractTests(unittest.TestCase):
         self.assertFalse(payload["summary"]["jwt_allowlist_configured"])
         self.assertEqual(payload["summary"]["jwt_allowlist_entries"], 0)
         self.assertEqual(payload["summary"]["test_cases_run"], 0)
-        self.assertEqual(payload["summary"]["skipped_tests"], 8)
+        self.assertEqual(payload["summary"]["skipped_tests"], 0)
         self.assertEqual(payload["summary"]["not_implemented_test_cases"], 0)
+        self.assertEqual(payload["summary"]["jwt_zero_request_reason"], "No eligible resolved API endpoints were present in the authorized discovery inventory.")
         self.assertTrue(
             all(
                 endpoint["test_results"][0]["status"] == "skipped"

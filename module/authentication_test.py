@@ -1,14 +1,21 @@
 import base64
 import hashlib
+import hmac
 import json
+import logging
+import os
 import re
 import secrets
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
 from module.endpoint_selection import EndpointSelector
 from module.signin import LoginConfigurationError, LoginError, Signin
+
+
+logger = logging.getLogger(__name__)
+_OWNER_FINGERPRINT_SALT = secrets.token_bytes(32)
 
 
 def _invalid_signature_token():
@@ -35,9 +42,11 @@ class AuthenticationTest:
     INVALID_TOKEN = _invalid_signature_token()
     TIMEOUT_SECONDS = 8
     MAX_EVIDENCE_RECORDS = 3
+    MAX_EVIDENCE_TRAVERSAL_LIMIT = 25
     MAX_EVIDENCE_FIELDS = 20
     MAX_EVIDENCE_NODES = 250
     MAX_EVIDENCE_BODY_BYTES = 1024 * 1024
+    MAX_ACTIVE_BOLA_CANDIDATES = 100
     _BODY_METADATA_KEYS = {
         "message",
         "error",
@@ -82,6 +91,7 @@ class AuthenticationTest:
         "resource",
     }
     _RESOURCE_IDENTIFIER_FIELDS = {"id", "_id", "uuid", "guid"}
+    _RESOURCE_IDENTIFIER_SUFFIXES = ("id", "uuid", "guid")
     _RESOURCE_DATA_FIELDS = {
         "name",
         "title",
@@ -113,6 +123,24 @@ class AuthenticationTest:
         "phone",
         "address",
     )
+    _OWNER_IDENTITY_FIELDS = {
+        "customername",
+        "ownername",
+        "username",
+        "customer",
+        "owner",
+    }
+
+    @staticmethod
+    def _owner_fingerprint(value):
+        if not isinstance(value, str) or not value.strip():
+            return None
+        normalized = value.strip().casefold().encode("utf-8")
+        return hmac.new(
+            _OWNER_FINGERPRINT_SALT,
+            normalized,
+            hashlib.sha256,
+        ).hexdigest()
 
     def __init__(self, endpoint_selector=None):
         self.endpoint_selector = endpoint_selector or EndpointSelector()
@@ -145,6 +173,144 @@ class AuthenticationTest:
         if cached.get("error_type") == "login":
             raise LoginError(cached["reason"], status_code=cached.get("status_code"))
         return dict(cached["token_info"])
+
+    def _signin_candidates(self, target, configuration, candidates, discovery):
+        candidate_configurations = configuration.get("_candidate_configurations", {})
+        if candidate_configurations:
+            configured_login_endpoint = configuration.get("login_endpoint")
+            configured_login_parts = urlsplit(configured_login_endpoint or "")
+            configured_login_path = (
+                configured_login_parts.path
+                if configured_login_parts.scheme or configured_login_parts.netloc
+                else configured_login_endpoint
+            )
+            eligible_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.get("path") in candidate_configurations
+            ]
+            if configuration.get("explicit_login_endpoint"):
+                eligible_candidates = [
+                    candidate
+                    for candidate in eligible_candidates
+                    if candidate.get("path") == configured_login_path
+                ]
+            candidates_to_try = eligible_candidates[:Signin.MAX_LOGIN_CANDIDATES]
+        elif configuration.get("explicit_login_endpoint") or not candidates:
+            configured_path = configuration.get("login_endpoint")
+            if not configured_path:
+                try:
+                    token_info = self._signin_once(target, configuration)
+                except (LoginConfigurationError, LoginError) as exc:
+                    discovery["login_attempt_status"] = "unavailable"
+                    raise LoginError(str(exc), status_code=exc.status_code) from exc
+                discovery["login_attempt_status"] = "succeeded"
+                discovery["token_or_session_detected"] = bool(
+                    token_info.get("token") or token_info.get("cookie")
+                )
+                return token_info
+            candidates_to_try = [
+                {
+                    "method": configuration.get("method", "POST"),
+                    "path": configured_path,
+                    "evidence_source": ["explicit_configuration"],
+                }
+            ]
+        else:
+            candidates_to_try = candidates[:Signin.MAX_LOGIN_CANDIDATES]
+
+        last_status = None
+        for candidate in candidates_to_try:
+            discovery["selected_login_route"] = candidate["path"]
+            discovery["selected_login_method"] = candidate.get("method", "POST")
+            discovery["selected_login_evidence_source"] = candidate.get(
+                "evidence_source", []
+            )
+            candidate_configuration = {
+                **configuration,
+                "login_endpoint": (
+                    configuration.get("login_endpoint")
+                    if configuration.get("explicit_login_endpoint")
+                    else candidate["path"]
+                ),
+                "method": candidate.get("method", "POST"),
+            }
+            candidate_contract = configuration.get(
+                "_candidate_configurations", {}
+            ).get(candidate["path"])
+            if candidate_contract:
+                candidate_configuration.update(candidate_contract)
+            try:
+                token_info = self._signin_once(target, candidate_configuration)
+            except LoginConfigurationError as exc:
+                logger.info(
+                    "Login candidate not attempted | method=%s | route=%s | reason=%s",
+                    candidate_configuration["method"],
+                    candidate["path"],
+                    str(exc),
+                )
+                discovery["login_attempts"].append(
+                    {
+                        "method": candidate_configuration["method"],
+                        "path": candidate["path"],
+                        "status": "not_attempted",
+                        "reason": str(exc),
+                    }
+                )
+                break
+            except LoginError as exc:
+                last_status = exc.status_code
+                logger.info(
+                    "Login candidate failed | method=%s | route=%s | http_status=%s | reason=%s",
+                    candidate_configuration["method"],
+                    candidate["path"],
+                    exc.status_code if exc.status_code is not None else "unavailable",
+                    str(exc),
+                )
+                discovery["login_attempts"].append(
+                    {
+                        "method": candidate_configuration["method"],
+                        "path": candidate["path"],
+                        "status": "failed",
+                        "http_status": exc.status_code,
+                        "reason": str(exc),
+                    }
+                )
+                continue
+
+            discovery["login_attempts"].append(
+                {
+                    "method": candidate_configuration["method"],
+                    "path": candidate["path"],
+                    "status": "succeeded",
+                    "http_status": token_info.get("http_status"),
+                }
+            )
+            discovery["login_attempt_status"] = "succeeded"
+            discovery["token_or_session_detected"] = bool(
+                token_info.get("token") or token_info.get("cookie")
+            )
+            return token_info
+
+        discovery["login_attempt_status"] = (
+            "failed"
+            if any(item.get("status") == "failed" for item in discovery["login_attempts"])
+            else "unavailable"
+        )
+        if not candidates_to_try:
+            reason = "No eligible login candidate was found; valid-token testing was skipped."
+        else:
+            attempt_details = [
+                f"{item['method']} {item['path']}: "
+                f"{item.get('reason') or item.get('status', 'not attempted')}"
+                for item in discovery["login_attempts"]
+            ]
+            reason = (
+                "Automatic login failed or could not run for eligible candidates within the "
+                f"{Signin.MAX_LOGIN_CANDIDATES}-request limit; no token or session was available. "
+                + "; ".join(attempt_details)
+            )
+        raise LoginError(reason, status_code=last_status)
 
     @staticmethod
     def _scope_url(target, path):
@@ -185,7 +351,27 @@ class AuthenticationTest:
         )
 
     @classmethod
+    def _evidence_traversal_limit(cls):
+        configured = os.environ.get("MICROSCAN_EVIDENCE_TRAVERSAL_LIMIT", "").strip()
+        if not configured:
+            return cls.MAX_EVIDENCE_RECORDS
+        try:
+            limit = int(configured)
+        except ValueError as exc:
+            raise ValueError(
+                "MICROSCAN_EVIDENCE_TRAVERSAL_LIMIT must be an integer between "
+                f"1 and {cls.MAX_EVIDENCE_TRAVERSAL_LIMIT}."
+            ) from exc
+        if not 1 <= limit <= cls.MAX_EVIDENCE_TRAVERSAL_LIMIT:
+            raise ValueError(
+                "MICROSCAN_EVIDENCE_TRAVERSAL_LIMIT must be an integer between "
+                f"1 and {cls.MAX_EVIDENCE_TRAVERSAL_LIMIT}."
+            )
+        return limit
+
+    @classmethod
     def _body_evidence(cls, response):
+        traversal_limit = cls._evidence_traversal_limit()
         content = response.content
         body_too_large = len(content) > cls.MAX_EVIDENCE_BODY_BYTES
         try:
@@ -201,9 +387,37 @@ class AuthenticationTest:
         json_keys = []
         empty_collection_paths = []
         resource_records = []
+        resource_identifiers = []
+        owner_identity_fingerprints = []
+        pagination = {
+            "detected": False,
+            "markers": [],
+            "has_more": None,
+            "next_page_available": False,
+            "current_page": None,
+            "total_pages": None,
+        }
         error_payload_observed = False
         visited_nodes = 0
         traversal_truncated = body_too_large
+        evidence_limitations = []
+        if body_too_large:
+            evidence_limitations.append("response_exceeded_evidence_parse_limit")
+        pagination_keys = {
+            "hasmore",
+            "has_more",
+            "next",
+            "nextpage",
+            "next_page",
+            "nextcursor",
+            "next_cursor",
+            "currentpage",
+            "current_page",
+            "pagenumber",
+            "page_number",
+            "totalpages",
+            "total_pages",
+        }
 
         def is_sensitive_key(key):
             lowered = str(key).lower()
@@ -230,10 +444,28 @@ class AuthenticationTest:
             nonlocal error_payload_observed, visited_nodes, traversal_truncated
             if visited_nodes >= cls.MAX_EVIDENCE_NODES:
                 traversal_truncated = True
+                if "json_node_traversal_limit" not in evidence_limitations:
+                    evidence_limitations.append("json_node_traversal_limit")
                 return
             visited_nodes += 1
 
             if isinstance(value, dict):
+                for key, child in value.items():
+                    if not isinstance(key, str):
+                        continue
+                    normalized_key = key.lower().replace("-", "_")
+                    if normalized_key in pagination_keys:
+                        pagination["detected"] = True
+                        if normalized_key not in pagination["markers"]:
+                            pagination["markers"].append(normalized_key)
+                        if normalized_key in {"hasmore", "has_more"} and isinstance(child, bool):
+                            pagination["has_more"] = child
+                        elif normalized_key in {"next", "nextpage", "next_page", "nextcursor", "next_cursor"}:
+                            pagination["next_page_available"] = child not in (None, "", False)
+                        elif normalized_key in {"currentpage", "current_page", "pagenumber", "page_number"} and isinstance(child, int):
+                            pagination["current_page"] = child
+                        elif normalized_key in {"totalpages", "total_pages"} and isinstance(child, int):
+                            pagination["total_pages"] = child
                 for key in value:
                     if (
                         isinstance(key, str)
@@ -292,23 +524,73 @@ class AuthenticationTest:
                     or (array_item and has_resource_field)
                     or single_field_resource
                 )
-                if (
-                    not parent_is_error
-                    and not is_error_object
-                    and len(resource_records) < cls.MAX_EVIDENCE_RECORDS
-                    and record_shape
-                ):
-                    resource_records.append(
-                        {
-                            "path": path[:160],
-                            "fields": {
-                                key[:64]: safe_field_type(child)
-                                for key, child in record_fields[
-                                    : cls.MAX_EVIDENCE_FIELDS
-                                ]
-                            },
-                        }
-                    )
+                if not parent_is_error and not is_error_object and record_shape:
+                    if len(resource_records) >= traversal_limit:
+                        traversal_truncated = True
+                        if "resource_record_sample_limit" not in evidence_limitations:
+                            evidence_limitations.append("resource_record_sample_limit")
+                    else:
+                        resource_records.append(
+                            {
+                                "path": path[:160],
+                                "fields": {
+                                    key[:64]: safe_field_type(child)
+                                    for key, child in record_fields[
+                                        : cls.MAX_EVIDENCE_FIELDS
+                                    ]
+                                },
+                            }
+                        )
+                        for key, child in record_fields:
+                            normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+                            if normalized_key not in cls._OWNER_IDENTITY_FIELDS:
+                                continue
+                            fingerprint = cls._owner_fingerprint(child)
+                            if fingerprint is None:
+                                continue
+                            owner_evidence = {
+                                "field": key[:64],
+                                "fingerprint": fingerprint,
+                                "path": path[:160],
+                            }
+                            if owner_evidence not in owner_identity_fingerprints:
+                                owner_identity_fingerprints.append(owner_evidence)
+                        for key, child in record_fields:
+                            normalized_key = key.lower().replace("_", "")
+                            if not (
+                                normalized_key in cls._RESOURCE_IDENTIFIER_FIELDS
+                                or normalized_key.endswith(cls._RESOURCE_IDENTIFIER_SUFFIXES)
+                            ):
+                                continue
+                            if isinstance(child, bool) or not isinstance(child, (str, int)):
+                                continue
+                            identifier = str(child).strip()
+                            if (
+                                not identifier
+                                or len(identifier) > 128
+                                or any(ord(character) < 32 for character in identifier)
+                            ):
+                                continue
+                            if (
+                                len(resource_identifiers)
+                                >= traversal_limit * 10
+                            ):
+                                traversal_truncated = True
+                                if "resource_identifier_limit" not in evidence_limitations:
+                                    evidence_limitations.append("resource_identifier_limit")
+                                break
+                            item = {
+                                "field": key[:64],
+                                "value": identifier,
+                                "path": path[:160],
+                            }
+                            if item not in resource_identifiers:
+                                resource_identifiers.append(item)
+                            if len(resource_identifiers) >= traversal_limit * 10:
+                                traversal_truncated = True
+                                if "resource_identifier_limit" not in evidence_limitations:
+                                    evidence_limitations.append("resource_identifier_limit")
+                                break
 
                 for key, child in value.items():
                     key_name = str(key).lower()
@@ -331,10 +613,12 @@ class AuthenticationTest:
             elif isinstance(value, list):
                 if not value:
                     empty_collection_paths.append(path[:160])
-                for index, child in enumerate(value[: cls.MAX_EVIDENCE_RECORDS]):
+                for index, child in enumerate(value[:traversal_limit]):
                     walk(child, f"{path}[{index}]", parent_is_error, True)
-                if len(value) > cls.MAX_EVIDENCE_RECORDS:
+                if len(value) > traversal_limit:
                     traversal_truncated = True
+                    if "array_item_traversal_limit" not in evidence_limitations:
+                        evidence_limitations.append("array_item_traversal_limit")
 
         if is_json:
             walk(body)
@@ -348,6 +632,9 @@ class AuthenticationTest:
             "body_available": body_available,
             "body_summary_partial": traversal_truncated,
             "body_truncated": body_too_large,
+            "response_body_over_evidence_limit": body_too_large,
+            "evidence_limitations": evidence_limitations,
+            "evidence_traversal_limit": traversal_limit,
             "body_summary_limit_bytes": cls.MAX_EVIDENCE_BODY_BYTES,
             "json_keys": json_keys,
             "authorization_denial_detected": http_denial or body_denial,
@@ -358,9 +645,12 @@ class AuthenticationTest:
             "resource_record_count_observed": record_count_observed,
             "resource_record_sample_count": record_count_observed,
             "resource_record_samples": resource_records,
+            "resource_identifiers": resource_identifiers,
+            "owner_identity_fingerprints": owner_identity_fingerprints,
+            "pagination": pagination,
             "empty_collection_observed": bool(empty_collection_paths),
             "empty_collection_paths": empty_collection_paths[
-                : cls.MAX_EVIDENCE_RECORDS
+                : traversal_limit
             ],
             "identifiable_business_data": record_count_observed > 0,
         }
@@ -517,6 +807,309 @@ class AuthenticationTest:
             "observed_challenge_scheme": challenge_scheme,
         }
 
+    def _active_bola_test_results(
+        self,
+        target,
+        collection_path,
+        resource_type,
+        route_templates,
+        responses,
+        authenticated_evidence,
+        authenticated_headers,
+        budget_state,
+    ):
+        from module.bola_analysis import BolaAnalyzer
+
+        baseline_status, baseline_reason = (
+            BolaAnalyzer._baseline_status(authenticated_evidence)
+            if isinstance(authenticated_evidence, dict)
+            else (
+                "unavailable",
+                "No authenticated collection response was captured.",
+            )
+        )
+        baseline_identifiers = (
+            BolaAnalyzer._typed_identifiers(authenticated_evidence, resource_type)
+            if isinstance(authenticated_evidence, dict)
+            else []
+        )
+        baseline_ids = {
+            item["value"]
+            for item in baseline_identifiers
+            if item.get("resource_type") == resource_type
+        }
+        baseline_owner_fingerprints = {
+            item["fingerprint"]
+            for item in (
+                authenticated_evidence.get("owner_identity_fingerprints", [])
+                if isinstance(authenticated_evidence, dict)
+                else []
+            )
+            if isinstance(item, dict)
+            and isinstance(item.get("fingerprint"), str)
+        }
+        baseline_owner_established = len(baseline_owner_fingerprints) == 1
+
+        observed_ids = []
+        for response in responses.values():
+            evidence = self._response_evidence(response)
+            for identifier in BolaAnalyzer._typed_identifiers(evidence, resource_type):
+                if (
+                    identifier.get("resource_type") == resource_type
+                    and identifier["value"] not in observed_ids
+                ):
+                    observed_ids.append(identifier["value"])
+        for route in route_templates:
+            if route.get("collection_path") != collection_path:
+                continue
+            for identifier in route.get("observed_identifiers", []):
+                if (
+                    isinstance(identifier, str)
+                    and identifier not in observed_ids
+                ):
+                    observed_ids.append(identifier)
+        if isinstance(authenticated_evidence, dict):
+            for identifier in baseline_identifiers:
+                if (
+                    identifier.get("resource_type") == resource_type
+                    and identifier["value"] not in observed_ids
+                ):
+                    observed_ids.append(identifier["value"])
+
+        candidates = []
+        for identifier in sorted(
+            observed_ids,
+            key=lambda value: (value in baseline_ids, observed_ids.index(value)),
+        ):
+            for route in route_templates:
+                if route.get("collection_path") != collection_path:
+                    continue
+                candidate_path = route["template"].replace(
+                    route["placeholder"], quote(identifier, safe="")
+                )
+                if any(item["path"] == candidate_path for item in candidates):
+                    continue
+                candidates.append(
+                    {
+                        "method": "GET",
+                        "path": candidate_path,
+                        "route_template": route["template"],
+                        "identifier_out_of_baseline": identifier not in baseline_ids,
+                        "baseline_status": baseline_status,
+                    }
+                )
+                if len(candidates) >= self.MAX_ACTIVE_BOLA_CANDIDATES:
+                    break
+            if len(candidates) >= self.MAX_ACTIVE_BOLA_CANDIDATES:
+                break
+
+        if not candidates:
+            reason = (
+                "Authenticated session is unavailable; no detail request was sent."
+                if not isinstance(authenticated_headers, dict)
+                else "The authenticated collection baseline is unavailable."
+                if baseline_status == "unavailable"
+                else "No identifiers were observed in captured responses."
+                if not observed_ids
+                else "No discovered detail-route template matched this collection."
+            )
+            return [
+                {
+                    "test_type": "active_bola_detail",
+                    "method": "GET",
+                    "path": collection_path,
+                    "selected": False,
+                    "sent": False,
+                    "response_received": False,
+                    "http_status": None,
+                    "content_type": None,
+                    "outcome": "not_attempted",
+                    "assessment": "inconclusive",
+                    "baseline_status": baseline_status,
+                    "reason": reason,
+                    "baseline_limitation": baseline_reason,
+                    "request_budget": {
+                        "configured": budget_state["configured"],
+                        "used": budget_state["used"],
+                        "remaining": max(
+                            budget_state["configured"] - budget_state["used"],
+                            0,
+                        ),
+                    },
+                }
+            ]
+
+        results = []
+        for candidate in candidates:
+            selected = (
+                isinstance(authenticated_headers, dict)
+                and baseline_status in {"complete", "partial"}
+                and budget_state["used"] < budget_state["configured"]
+            )
+            if not isinstance(authenticated_headers, dict):
+                reason = "Authenticated session is unavailable; no detail request was sent."
+                outcome = "not_attempted"
+            elif baseline_status not in {"complete", "partial"}:
+                reason = (
+                    "Authenticated collection baseline is unavailable; comparison would "
+                    "not be reliable."
+                )
+                outcome = "not_attempted"
+            elif not selected:
+                reason = "The BOLA-specific request budget is exhausted."
+                outcome = "not_attempted"
+            else:
+                reason = None
+                outcome = "request_sent"
+
+            record = {
+                "test_type": "active_bola_detail",
+                "method": candidate["method"],
+                "path": candidate["path"],
+                "route_template": candidate["route_template"],
+                "selected": selected,
+                "sent": False,
+                "response_received": False,
+                "http_status": None,
+                "content_type": None,
+                "outcome": outcome,
+                "assessment": "inconclusive",
+                "baseline_status": candidate["baseline_status"],
+                "identifier_comparison": (
+                    "out_of_observed_baseline"
+                    if candidate["identifier_out_of_baseline"]
+                    else "in_observed_baseline"
+                ),
+                "reason": reason,
+                "baseline_limitation": baseline_reason,
+            }
+            if selected:
+                budget_state["used"] += 1
+                record["sent"] = True
+                try:
+                    url = self._scope_url(target, candidate["path"])
+                    response = self._run_http_request(
+                        "GET",
+                        url,
+                        headers=authenticated_headers,
+                    )
+                except httpx.TimeoutException:
+                    record.update(
+                        {
+                            "outcome": "request_timeout",
+                            "reason": "Authenticated detail request timed out.",
+                        }
+                    )
+                except httpx.RequestError:
+                    record.update(
+                        {
+                            "outcome": "request_error",
+                            "reason": "Authenticated detail request failed to reach the local target.",
+                        }
+                    )
+                else:
+                    detail_evidence = self._response_evidence(response)
+                    status_code = detail_evidence["status_code"]
+                    content_type = detail_evidence["content_type"]
+                    response_owner_fields = [
+                        {
+                            "field": item["field"],
+                            "fingerprint": item["fingerprint"],
+                        }
+                        for item in detail_evidence.get(
+                            "owner_identity_fingerprints", []
+                        )
+                        if isinstance(item, dict)
+                        and isinstance(item.get("field"), str)
+                        and isinstance(item.get("fingerprint"), str)
+                    ]
+                    response_owner_fingerprints = {
+                        item["fingerprint"] for item in response_owner_fields
+                    }
+                    owner_relation = "identity_unavailable"
+                    if baseline_owner_established and response_owner_fingerprints:
+                        if response_owner_fingerprints == baseline_owner_fingerprints:
+                            owner_relation = "matches_authenticated_baseline"
+                        elif response_owner_fingerprints.isdisjoint(
+                            baseline_owner_fingerprints
+                        ):
+                            owner_relation = "differs_from_authenticated_baseline"
+                    object_returned = bool(
+                        200 <= status_code < 300
+                        and detail_evidence["response_is_json"]
+                        and detail_evidence["resource_records_observed"]
+                        and not detail_evidence["authentication_denied"]
+                    )
+                    record.update(
+                        {
+                            "response_received": True,
+                            "http_status": status_code,
+                            "content_type": content_type,
+                            "outcome": (
+                                "object_response"
+                                if object_returned
+                                else "response_received"
+                            ),
+                            "assessment": (
+                                "confirmed"
+                                if object_returned
+                                and candidate["identifier_out_of_baseline"]
+                                and owner_relation
+                                == "differs_from_authenticated_baseline"
+                                else "not_detected"
+                                if object_returned
+                                and owner_relation
+                                == "matches_authenticated_baseline"
+                                else "potential"
+                                if object_returned
+                                and candidate["identifier_out_of_baseline"]
+                                else "not_detected"
+                                if status_code in {401, 403, 404}
+                                else "inconclusive"
+                            ),
+                            "owner_identity_evidence": {
+                                "comparison": owner_relation,
+                                "authenticated_baseline_established": (
+                                    baseline_owner_established
+                                ),
+                                "authenticated_baseline_fingerprints": sorted(
+                                    baseline_owner_fingerprints
+                                ),
+                                "response_fields": response_owner_fields,
+                            },
+                            "reason": (
+                                "An authenticated request for an identifier absent from the "
+                                "observed collection baseline returned a JSON resource object "
+                                "whose owner field differs from the consistent owner identity "
+                                "in the authenticated collection baseline."
+                                if object_returned
+                                and candidate["identifier_out_of_baseline"]
+                                and owner_relation
+                                == "differs_from_authenticated_baseline"
+                                else
+                                "An authenticated request for an identifier absent from the "
+                                "observed collection baseline returned a JSON resource object. "
+                                "This is potential evidence only; authorization policy and "
+                                "resource ownership were not established."
+                                if object_returned
+                                and candidate["identifier_out_of_baseline"]
+                                else "The response did not establish unauthorized object access."
+                            ),
+                        }
+                    )
+            results.append(record)
+        request_budget = {
+            "configured": budget_state["configured"],
+            "used": budget_state["used"],
+            "remaining": max(
+                budget_state["configured"] - budget_state["used"],
+                0,
+            ),
+        }
+        for result in results:
+            result["request_budget"] = request_budget
+        return results
+
     @staticmethod
     def _test_result(status, reason, evidence, tested_endpoint=None):
         return {
@@ -600,6 +1193,9 @@ class AuthenticationTest:
                 "body_available",
                 "body_summary_partial",
                 "body_truncated",
+                "response_body_over_evidence_limit",
+                "evidence_limitations",
+                "evidence_traversal_limit",
                 "body_summary_limit_bytes",
                 "authorization_denial_detected",
                 "http_status_denial",
@@ -609,6 +1205,9 @@ class AuthenticationTest:
                 "resource_record_count_observed",
                 "resource_record_sample_count",
                 "resource_record_samples",
+                "resource_identifiers",
+                "owner_identity_fingerprints",
+                "pagination",
                 "empty_collection_observed",
                 "empty_collection_paths",
                 "identifiable_business_data",
@@ -829,6 +1428,17 @@ class AuthenticationTest:
         login_candidates = self.endpoint_selector.discover_login_candidates(
             discovered_endpoints
         )
+        public_login_candidates = [
+            {
+                "method": item.get("method"),
+                "path": item.get("path"),
+                "discovery_status": item.get("discovery_status"),
+                "evidence_source": item.get("evidence_source", []),
+                "allow_header_methods": item.get("allow_header_methods", []),
+                "request_content_type": item.get("request_content_type"),
+            }
+            for item in login_candidates
+        ]
         discovery = {
             "tested_endpoint": {
                 "method": method,
@@ -840,12 +1450,17 @@ class AuthenticationTest:
                 ),
             },
             "endpoint_selection_reason": selection_reason,
-            "discovered_login_endpoints": login_candidates,
+            "discovered_login_endpoints": public_login_candidates,
             "authentication_mechanism": "unknown",
-            "note": (
-                "Login endpoints are reported only when discovered. No login schema or "
-                "credentials are inferred."
-            ),
+            "login_discovery_status": "found" if login_candidates else "not_found",
+            "login_attempt_status": "not_attempted",
+            "authentication_result": "unavailable",
+            "token_or_session_detected": False,
+            "selected_login_route": None,
+            "selected_login_method": None,
+            "selected_login_evidence_source": [],
+            "login_attempts": [],
+            "note": "Login discovery and authentication are independent of API discovery.",
         }
         challenges = [
             item.get("observed_challenge_scheme")
@@ -864,16 +1479,49 @@ class AuthenticationTest:
             ),
             "evidence": None,
         }
+        authenticated_headers = None
         try:
             auth_config, discovered_login_candidates, configuration_note = (
                 Signin.configured_auth(discovered_endpoints)
             )
-            discovery["discovered_login_endpoints"] = discovered_login_candidates
+            discovery["discovered_login_endpoints"] = [
+                {
+                    "method": item.get("method"),
+                    "path": item.get("path"),
+                    "discovery_status": item.get("discovery_status"),
+                    "evidence_source": item.get("evidence_source", []),
+                    "allow_header_methods": item.get("allow_header_methods", []),
+                    "request_content_type": item.get("request_content_type"),
+                }
+                for item in discovered_login_candidates
+            ]
+            discovery["login_discovery_status"] = (
+                "found" if discovered_login_candidates else "not_found"
+            )
             if auth_config is None:
                 authenticated_check["reason"] = configuration_note
+                discovery["login_attempt_status"] = "unavailable"
+                logger.info(
+                    "Login executor not called | candidates=%d | selected_route=none | "
+                    "reason=%s",
+                    len(discovered_login_candidates),
+                    configuration_note,
+                )
             else:
-                token_info = self._signin_once(target, auth_config)
+                logger.info(
+                    "Login executor ready | candidates=%d | "
+                    "request_limit=%d",
+                    len(discovered_login_candidates),
+                    Signin.MAX_LOGIN_CANDIDATES,
+                )
+                token_info = self._signin_candidates(
+                    target,
+                    auth_config,
+                    discovered_login_candidates,
+                    discovery,
+                )
                 token = token_info.pop("token")
+                cookie = token_info.pop("cookie", None)
                 scheme = token_info.get("auth_scheme") or (
                     challenges[0] if challenges else None
                 )
@@ -891,29 +1539,41 @@ class AuthenticationTest:
                     }.get(scheme_source, "observed")
                     mechanism = f"{token_format}{scheme} ({source_label})"
                 discovery["authentication_mechanism"] = mechanism
-                if not scheme:
+                if not scheme and not cookie:
                     authenticated_check["reason"] = (
                         "Login succeeded and a token was obtained, but the API did not provide "
                         "an authorization scheme. Configure auth_scheme in MICROSCAN_AUTH_CONFIG."
                     )
-                elif not re.fullmatch(r"[A-Za-z0-9-]+", token_info["auth_header"]):
+                elif not cookie and not re.fullmatch(
+                    r"[A-Za-z0-9-]+", token_info["auth_header"]
+                ):
                     authenticated_check["reason"] = (
                         "Login succeeded, but configured auth_header is invalid."
                     )
                 else:
+                    authenticated_headers = (
+                        {"Cookie": cookie}
+                        if cookie
+                        else {
+                            token_info["auth_header"]: f"{scheme} {token}"
+                        }
+                    )
                     try:
                         response = self._run_http_request(
                             method,
                             url,
-                            headers={
-                                token_info["auth_header"]: f"{scheme} {token}"
-                            },
+                            headers=authenticated_headers,
                         )
                         responses["authenticated"] = response
                         authenticated_check = {
                             "status": "tested",
                             "request_attempted": True,
-                            "reason": self._authenticated_probe_reason(scheme_source),
+                            "reason": (
+                                "Login returned a session cookie; the cookie was used for "
+                                "the protected-endpoint request."
+                                if cookie
+                                else self._authenticated_probe_reason(scheme_source)
+                            ),
                             "login_status": token_info["http_status"],
                             "auth_scheme_source": scheme_source,
                             "login_response_content_type": token_info[
@@ -921,6 +1581,16 @@ class AuthenticationTest:
                             ],
                             "evidence": self._response_evidence(response),
                         }
+                        if authenticated_check["evidence"].get("status_code") == 401:
+                            discovery["authentication_result"] = "failed"
+                        elif authenticated_check["evidence"].get("status_code") == 403:
+                            discovery["authentication_result"] = "inconclusive"
+                        elif authenticated_check["evidence"].get("authentication_denied"):
+                            discovery["authentication_result"] = "inconclusive"
+                        elif authenticated_check["evidence"].get("protected_data_observed"):
+                            discovery["authentication_result"] = "success"
+                        else:
+                            discovery["authentication_result"] = "inconclusive"
                     except httpx.TimeoutException:
                         authenticated_check = {
                             "status": "error",
@@ -942,6 +1612,7 @@ class AuthenticationTest:
                         }
                 token = None
         except LoginConfigurationError as exc:
+            discovery["login_attempt_status"] = "unavailable"
             authenticated_check = {
                 "status": "error",
                 "request_attempted": False,
@@ -949,6 +1620,19 @@ class AuthenticationTest:
                 "evidence": None,
             }
         except LoginError as exc:
+            discovery["login_attempt_status"] = (
+                "failed"
+                if any(
+                    item.get("status") == "failed"
+                    for item in discovery["login_attempts"]
+                )
+                else "unavailable"
+            )
+            discovery["authentication_result"] = (
+                "failed"
+                if discovery["login_attempt_status"] == "failed"
+                else "unavailable"
+            )
             authenticated_check = {
                 "status": "error",
                 "request_attempted": False,
@@ -958,6 +1642,27 @@ class AuthenticationTest:
             }
         finally:
             token = None
+
+        active_bola_tests = []
+        active_bola_context = selected_endpoint.get("active_bola_context")
+        if isinstance(active_bola_context, dict):
+            active_bola_tests = self._active_bola_test_results(
+                target=target,
+                collection_path=active_bola_context["collection_path"],
+                resource_type=active_bola_context["resource_type"],
+                route_templates=active_bola_context["route_templates"],
+                responses=responses,
+                authenticated_evidence=authenticated_check.get("evidence"),
+                authenticated_headers=(
+                    authenticated_headers
+                    if authenticated_check.get("status") == "tested"
+                    and isinstance(authenticated_check.get("evidence"), dict)
+                    and authenticated_check["evidence"].get("status_code")
+                    not in {401, 403}
+                    else None
+                ),
+                budget_state=active_bola_context["budget_state"],
+            )
 
         evidence = [
             {"request": "endpoint_selection", "reason": selection_reason},
@@ -1073,6 +1778,9 @@ class AuthenticationTest:
                             "body_available",
                             "body_summary_partial",
                             "body_truncated",
+                            "response_body_over_evidence_limit",
+                            "evidence_limitations",
+                            "evidence_traversal_limit",
                             "body_summary_limit_bytes",
                             "authorization_denial_detected",
                             "http_status_denial",
@@ -1082,6 +1790,9 @@ class AuthenticationTest:
                             "resource_record_count_observed",
                             "resource_record_sample_count",
                             "resource_record_samples",
+                            "resource_identifiers",
+                            "owner_identity_fingerprints",
+                            "pagination",
                             "empty_collection_observed",
                             "empty_collection_paths",
                             "identifiable_business_data",
@@ -1191,6 +1902,7 @@ class AuthenticationTest:
                 "authenticated_check": authenticated_check,
                 "authentication_mechanism": discovery["authentication_mechanism"],
                 "test_cases": test_cases,
+                "active_bola_tests": active_bola_tests,
             }
         )
         return result

@@ -5,6 +5,7 @@ import re
 from urllib.parse import urlsplit
 
 from module.authentication_test import AuthenticationTest
+from module.bola_analysis import BolaAnalyzer
 from module.endpoint_selection import EndpointSelector
 from module.signin import LoginConfigurationError, Signin
 
@@ -13,6 +14,7 @@ _UNSELECTED = object()
 _READ_ONLY_METHODS = {"GET"}
 _MAX_AUTOMATIC_JWT_ENDPOINTS = 5
 _MAX_CONFIGURED_JWT_ENDPOINTS = 100
+_DEFAULT_ACTIVE_BOLA_REQUEST_BUDGET = 10
 
 
 class Modules:
@@ -220,6 +222,92 @@ class Modules:
         return budget
 
     @staticmethod
+    def _active_bola_request_budget():
+        raw = os.environ.get("MICROSCAN_BOLA_REQUEST_BUDGET", "").strip()
+        if not raw:
+            return _DEFAULT_ACTIVE_BOLA_REQUEST_BUDGET
+        try:
+            budget = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "MICROSCAN_BOLA_REQUEST_BUDGET must be an integer between 1 and 100."
+            ) from exc
+        if not 1 <= budget <= _MAX_CONFIGURED_JWT_ENDPOINTS:
+            raise ValueError(
+                "MICROSCAN_BOLA_REQUEST_BUDGET must be an integer between 1 and 100."
+            )
+        return budget
+
+    def _active_bola_route_templates(self, target, endpoints, discovered_templates):
+        routes = {}
+
+        def add_template(method, raw_template, observed_identifier=None):
+            if str(method or "").upper() != "GET" or not isinstance(raw_template, str):
+                return
+            template_path, path_error = self._discovered_path(
+                {"path": raw_template}, target
+            )
+            if path_error or not template_path:
+                return
+            segments = template_path.strip("/").split("/")
+            if not segments or not re.fullmatch(
+                r"(?:\$\{[^}]+\}|\{[^}]+\}|:[A-Za-z_][A-Za-z0-9_]*|\*)",
+                segments[-1],
+            ):
+                return
+            if any(
+                re.search(r"\$\{|\{|\}|:", segment)
+                for segment in segments[:-1]
+            ):
+                return
+            collection_path = "/" + "/".join(segments[:-1])
+            if collection_path == "/":
+                return
+            resource_type = BolaAnalyzer._type_name(segments[-2])
+            if resource_type not in BolaAnalyzer.COLLECTION_TYPES:
+                return
+            key = (collection_path, template_path)
+            route = routes.setdefault(
+                key,
+                {
+                    "collection_path": collection_path,
+                    "template": template_path,
+                    "placeholder": segments[-1],
+                    "resource_type": resource_type,
+                    "observed_identifiers": [],
+                },
+            )
+            if (
+                isinstance(observed_identifier, str)
+                and observed_identifier not in route["observed_identifiers"]
+            ):
+                route["observed_identifiers"].append(observed_identifier)
+
+        for item in discovered_templates or []:
+            if not isinstance(item, dict):
+                continue
+            add_template(
+                item.get("method"),
+                item.get("template") or item.get("path"),
+            )
+        for endpoint in endpoints:
+            if str(endpoint.get("method") or "").upper() != "GET":
+                continue
+            route = BolaAnalyzer._resource_route(endpoint)
+            if (
+                route
+                and not route["is_collection"]
+                and route["requested_id"] is not None
+                and route["resource_type"] in BolaAnalyzer.COLLECTION_TYPES
+            ):
+                add_template(
+                    "GET",
+                    f"{route['collection_path']}/{{id}}",
+                    observed_identifier=route["requested_id"],
+                )
+        return list(routes.values())
+
+    @staticmethod
     def _automatic_route_group(path):
         segments = path.split("/")
         grouped_segments = []
@@ -318,7 +406,14 @@ class Modules:
             discovered_endpoints,
         )
 
-    def analyze_endpoints(self, target, results, auto_jwt_local_lab=False):
+    def analyze_endpoints(
+        self,
+        target,
+        results,
+        auto_jwt_local_lab=False,
+        discovered_inventory=None,
+        discovered_route_templates=None,
+    ):
         analyzed = []
         seen = set()
         for endpoint in results:
@@ -352,10 +447,35 @@ class Modules:
 
         allowlist = self._endpoint_allowlist()
         allowlist_set = set(allowlist)
+        authentication_inventory = (
+            discovered_inventory
+            if discovered_inventory is not None
+            else analyzed
+        )
         endpoints_by_identity = {
             (endpoint.get("method") or "", endpoint.get("path")): endpoint
             for endpoint in analyzed
         }
+        active_bola_enabled = bool(
+            auto_jwt_local_lab and self._is_local_target(target)
+        )
+        active_bola_budget = (
+            {
+                "configured": self._active_bola_request_budget(),
+                "used": 0,
+            }
+            if active_bola_enabled
+            else None
+        )
+        active_bola_route_templates = (
+            self._active_bola_route_templates(
+                target,
+                analyzed,
+                discovered_route_templates,
+            )
+            if active_bola_enabled
+            else []
+        )
         for method, path in allowlist:
             identity = (method, path)
             if identity not in endpoints_by_identity:
@@ -378,8 +498,15 @@ class Modules:
         auto_mode_reason = None
         selected_reasons = {}
         automatic_skip_reasons = {}
+        selection_budget = {
+            "mode": None,
+            "configured": None,
+            "used": None,
+            "remaining": None,
+        }
         if allowlist:
             selection_mode = "explicit_allowlist"
+            selection_budget["mode"] = selection_mode
             selected_reasons = {
                 identity: "Endpoint explicitly included in JWT endpoint allowlist."
                 for identity in allowlist_set
@@ -387,6 +514,7 @@ class Modules:
             }
         elif auto_jwt_local_lab and self._is_local_target(target):
             selection_mode = "automatic_local_lab"
+            selection_budget["mode"] = selection_mode
             candidates_by_group = {}
             for discovery_index, endpoint in enumerate(analyzed):
                 if endpoint.get("discovery_source") != "discovery":
@@ -419,6 +547,13 @@ class Modules:
                     ),
                 )[:endpoint_budget]
             }
+            selection_budget.update(
+                {
+                    "configured": endpoint_budget,
+                    "used": len(selected_groups),
+                    "remaining": max(endpoint_budget - len(selected_groups), 0),
+                }
+            )
             representative_by_group = {
                 group: candidate for group, candidate in representatives
             }
@@ -443,12 +578,14 @@ class Modules:
                         )
         elif auto_jwt_local_lab:
             selection_mode = "blocked_non_local_target"
+            selection_budget["mode"] = selection_mode
             auto_mode_reason = (
                 "Automatic JWT testing is restricted to loopback targets "
                 "(localhost, 127.0.0.0/8, or ::1)."
             )
         else:
             selection_mode = "not_confirmed"
+            selection_budget["mode"] = selection_mode
             auto_mode_reason = (
                 "Automatic JWT selection is disabled for this scan; configure an explicit "
                 "endpoint allowlist to test specific discovered endpoints."
@@ -461,6 +598,7 @@ class Modules:
                 is_allowlisted = identity in allowlist_set
                 endpoint["jwt_allowlisted"] = is_allowlisted
                 endpoint["jwt_selection_mode"] = selection_mode
+                endpoint["jwt_selection_budget"] = dict(selection_budget)
                 reason = selected_reasons.get(identity)
                 if endpoint.get("discovery_source") == "configured_allowlist":
                     endpoint["jwt_selected"] = False
@@ -540,12 +678,48 @@ class Modules:
                     "method": identity[0],
                     "reason": reason,
                 }
+                resource_route = BolaAnalyzer._resource_route(endpoint)
+                if (
+                    active_bola_budget is not None
+                    and resource_route
+                    and resource_route["is_collection"]
+                    and resource_route["resource_type"]
+                    in BolaAnalyzer.COLLECTION_TYPES
+                ):
+                    candidate["active_bola_context"] = {
+                        "collection_path": resource_route["collection_path"],
+                        "resource_type": resource_route["resource_type"],
+                        "route_templates": [
+                            route
+                            for route in active_bola_route_templates
+                            if route["collection_path"]
+                            == resource_route["collection_path"]
+                        ],
+                        "budget_state": active_bola_budget,
+                    }
                 result = self.evaluate_authentication_test(
                     target,
-                    analyzed,
+                    authentication_inventory,
                     selected_candidate=candidate,
                 )
                 endpoint["test_results"].append(result)
+            bola_data = BolaAnalyzer(self.endpoint_selector).analyze(analyzed)
+            endpoints_by_identity = {
+                (endpoint.get("method"), endpoint.get("path")): endpoint
+                for endpoint in analyzed
+            }
+            for baseline in bola_data["baselines"]:
+                endpoint = endpoints_by_identity.get(
+                    (baseline.get("method"), baseline.get("collection_endpoint"))
+                )
+                if endpoint is not None:
+                    endpoint["bola_baseline"] = baseline
+            for assessment in bola_data["assessments"]:
+                endpoint = endpoints_by_identity.get(
+                    (assessment.get("method"), assessment.get("resource_endpoint"))
+                )
+                if endpoint is not None:
+                    endpoint["bola_assessment"] = assessment
         finally:
             self.authentication_test.reset_scan_state()
         return analyzed
