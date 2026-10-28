@@ -1,5 +1,6 @@
 import asyncio
 import ast
+import ipaddress
 import json
 import os
 import re
@@ -10,7 +11,6 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -22,15 +22,6 @@ from module.pentest_report import build_pentest_report
 from module.signin import LoginConfigurationError, Signin
 
 app = FastAPI(title="MicroScan API", version="1.0.0")
-
-TRUSTED_LOCAL_LAB_PROFILES = {
-    ("localhost", 3000): ("http://localhost:8085",),
-    ("localhost", 8085): (),
-    ("127.0.0.1", 3000): ("http://127.0.0.1:8085",),
-    ("127.0.0.1", 8085): (),
-    ("::1", 3000): ("http://[::1]:8085",),
-    ("::1", 8085): (),
-}
 
 
 @dataclass(frozen=True)
@@ -56,39 +47,11 @@ class FileDiscoveryRequest(BaseModel):
     gateway_target: str | None = Field(default=None, max_length=2048)
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 def validate_target(target: str):
     try:
         return Signin.normalize_target(target)
     except LoginConfigurationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-def _configured_gateway_target():
-    Signin.load_environment()
-    configured = os.environ.get("MICROSCAN_GATEWAY_TARGET", "").strip()
-    if not configured:
-        return None
-    try:
-        return normalize_origin(validate_target(configured)).rstrip("/")
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"MICROSCAN_GATEWAY_TARGET is outside the authorized local lab scope: {exc}",
-        ) from exc
 
 
 def _normalized_scope_origin(value):
@@ -100,18 +63,53 @@ def _normalized_scope_origin(value):
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), "", "", ""))
 
 
-def _authorized_scan_scope(target, scope_origins, legacy_gateway=None):
+def _is_loopback_origin(value):
+    try:
+        hostname = (urlsplit(value).hostname or "").lower()
+        return hostname == "localhost" or ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _discovered_url_origins(file_result):
+    origins = set()
+    records = file_result.get("results", []) if isinstance(file_result, dict) else []
+    for record in records:
+        if not isinstance(record, dict) or record.get("is_template"):
+            continue
+        candidate = (
+            record.get("resolved_url")
+            or record.get("verification_url")
+            or record.get("url")
+        )
+        if not isinstance(candidate, str):
+            continue
+        try:
+            parts = urlsplit(candidate)
+            if not parts.scheme or not parts.netloc:
+                continue
+            origin = _normalized_scope_origin(
+                urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+            )
+        except (ValueError, HTTPException):
+            continue
+        origins.add(origin)
+    return origins
+
+
+def _discovered_loopback_origins(file_result, target):
+    if not _is_loopback_origin(target):
+        return set()
+    return {
+        origin
+        for origin in _discovered_url_origins(file_result)
+        if _is_loopback_origin(origin)
+    }
+
+
+def _authorized_scan_scope(target, scope_origins):
     origins = [_normalized_scope_origin(target)]
-    parsed_target = urlsplit(origins[0])
-    profile_origins = TRUSTED_LOCAL_LAB_PROFILES.get(
-        ((parsed_target.hostname or "").lower(), parsed_target.port or 80),
-        (),
-    )
-    for origin in profile_origins:
-        normalized = _normalized_scope_origin(origin)
-        if normalized not in origins:
-            origins.append(normalized)
-    for origin in [*(scope_origins or []), legacy_gateway]:
+    for origin in scope_origins or []:
         if not origin:
             continue
         normalized = _normalized_scope_origin(origin)
@@ -287,17 +285,6 @@ def _recursive_seed_batches(file_result, frontend_target, authorized_origins):
     records = file_result.get("results", []) if isinstance(file_result, dict) else []
     allowed = set(authorized_origins)
     frontend_origin = _normalized_scope_origin(frontend_target)
-    frontend_parts = urlsplit(frontend_origin)
-    trusted_local_origins = TRUSTED_LOCAL_LAB_PROFILES.get(
-        ((frontend_parts.hostname or "").lower(), frontend_parts.port or 80),
-        (),
-    )
-    configured_gateway = None
-    if raw_gateway := os.environ.get("MICROSCAN_GATEWAY_TARGET", "").strip():
-        try:
-            configured_gateway = _normalized_scope_origin(raw_gateway)
-        except (ValueError, HTTPException):
-            configured_gateway = None
     paths_by_origin = {}
     relative_paths = []
     base_urls_by_origin = {}
@@ -559,10 +546,6 @@ def _recursive_seed_batches(file_result, frontend_target, authorized_origins):
     if relative_paths:
         if base_urls_by_origin:
             relative_targets = set(base_urls_by_origin)
-        elif configured_gateway in allowed:
-            relative_targets = {configured_gateway}
-        elif trusted_local_origins:
-            relative_targets = set(trusted_local_origins)
         else:
             relative_targets = {frontend_origin}
         authorized_relative_targets = relative_targets & allowed
@@ -608,8 +591,6 @@ def _recursive_seed_batches(file_result, frontend_target, authorized_origins):
                 item["resolution_rule"] = (
                     "explicit_api_base"
                     if origin in base_urls_by_origin
-                    else "trusted_local_lab_profile"
-                    if origin in trusted_local_origins
                     else "authorized_origin"
                 )
                 paths_by_origin.setdefault(origin, []).extend(
@@ -636,35 +617,7 @@ def _recursive_seed_batches(file_result, frontend_target, authorized_origins):
 
 
 def _authorized_discovered_origins(file_result, authorized_origins):
-    allowed = set(authorized_origins)
-    origins = set()
-    records = file_result.get("results", []) if isinstance(file_result, dict) else []
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        candidate = (
-            record.get("resolved_url")
-            or record.get("verification_url")
-            or record.get("url")
-        )
-        if not isinstance(candidate, str):
-            continue
-        try:
-            parts = urlsplit(candidate)
-            if not parts.scheme or not parts.netloc:
-                continue
-            origin = _normalized_scope_origin(
-                urlunsplit((parts.scheme, parts.netloc, "", "", ""))
-            )
-        except (ValueError, HTTPException):
-            continue
-        if origin in allowed and (
-            record.get("is_api_endpoint") is True
-            or _javascript_root_origin(record)
-            or _javascript_api_base(record)
-        ):
-            origins.add(origin)
-    return origins
+    return _discovered_url_origins(file_result) & set(authorized_origins)
 
 
 def _merge_file_discovery_results(destination, incoming):
@@ -728,18 +681,10 @@ def _deduplicate_seed_results(results, origin):
 
 def _api_candidate_security_target(
     primary_target,
-    gateway_target,
     authorized_origins,
     discovery_results,
 ):
-    if not gateway_target:
-        return primary_target
-    try:
-        expected = _normalized_scope_origin(gateway_target)
-    except (ValueError, HTTPException):
-        return primary_target
-    if expected not in set(authorized_origins):
-        return primary_target
+    authorized = set(authorized_origins)
     for record in discovery_results:
         if not isinstance(record, dict):
             continue
@@ -763,8 +708,7 @@ def _api_candidate_security_target(
         except (ValueError, HTTPException):
             continue
         if (
-            origin == expected
-            and origin in set(authorized_origins)
+            origin in authorized
             and path
             and path != "/"
             and (
@@ -772,7 +716,7 @@ def _api_candidate_security_target(
                 or re.match(r"^/api(?:/|$)", path, re.IGNORECASE)
             )
         ):
-            return gateway_target
+            return origin
     return primary_target
 
 
@@ -1242,7 +1186,7 @@ def _correlate_discoveries(
     kiterunner_results,
     file_results,
     scan_origin,
-    gateway_target,
+    target_origin,
     frontend_page_scanned=False,
     security_target=None,
 ):
@@ -1543,11 +1487,11 @@ def _correlate_discoveries(
                 urlsplit(scan_origin).netloc.lower(),
             )
         }
-        if gateway_target:
+        if target_origin:
             allowed_security_origins.add(
                 (
-                    urlsplit(gateway_target).scheme.lower(),
-                    urlsplit(gateway_target).netloc.lower(),
+                    urlsplit(target_origin).scheme.lower(),
+                    urlsplit(target_origin).netloc.lower(),
                 )
             )
         if (
@@ -1670,45 +1614,8 @@ async def _run_scan_pipeline(
         if progress_callback:
             await progress_callback(event)
 
-    gateway_target = None
-    gateway_config_error = None
-    try:
-        gateway_target = _configured_gateway_target()
-    except HTTPException as exc:
-        gateway_config_error = str(exc.detail)
-        logger.warning(
-            "Ignoring invalid legacy Gateway configuration | reason=%s",
-            gateway_config_error,
-        )
-
-    legacy_gateway_target = gateway_target
-    authorized_origins = _authorized_scan_scope(
-        normalized_target, scope_origins, legacy_gateway_target
-    )
-    if gateway_target is None:
-        frontend_origin = _normalized_scope_origin(normalized_target)
-        additional_origins = [
-            origin for origin in authorized_origins if origin != frontend_origin
-        ]
-        gateway_target = next(
-            (
-                origin
-                for origin in additional_origins
-                if (urlsplit(origin).hostname or "").lower()
-                in {"localhost", "127.0.0.1", "::1"}
-                and urlsplit(origin).port == 8085
-            ),
-            additional_origins[0] if additional_origins else None,
-        )
-    file_gateway_target = None
-    if gateway_target:
-        try:
-            file_gateway_target = normalize_origin(gateway_target).rstrip("/")
-        except ValueError:
-            logger.info(
-                "File Discovery endpoint verification is unsupported for scoped origin %s",
-                gateway_target,
-            )
+    authorized_origins = _authorized_scan_scope(normalized_target, scope_origins)
+    file_verification_target = normalize_origin(normalized_target).rstrip("/")
     discovery_target = normalized_target
     limits = DISCOVERY_LIMITS
     logger.info(
@@ -1759,8 +1666,8 @@ async def _run_scan_pipeline(
     try:
         file_result = await FileDiscovery().scan(
             normalized_target,
-            verify_endpoints=bool(file_gateway_target),
-            gateway_target=file_gateway_target,
+            verify_endpoints=bool(file_verification_target),
+            gateway_target=file_verification_target,
             progress_callback=emit,
         )
         request_count = file_result.get("summary", {}).get("requests_made", 0)
@@ -1791,6 +1698,24 @@ async def _run_scan_pipeline(
                 "File Discovery could not retrieve an in-scope HTML document.",
             )
 
+    local_api_origins = sorted(
+        _discovered_loopback_origins(file_result, normalized_target)
+        - set(authorized_origins)
+    )
+    authorized_origins.extend(local_api_origins)
+    if local_api_origins:
+        await emit(
+            {
+                "stage": "Authorized Scope",
+                "status": "completed",
+                "detail": (
+                    f"{', '.join(authorized_origins)} "
+                    "(loopback API origins found in target evidence)"
+                ),
+                "origins": authorized_origins,
+            }
+        )
+
     limits = DISCOVERY_LIMITS
     origin_discovery_rounds = []
     visited_discovery_origins = {_normalized_scope_origin(discovery_target)}
@@ -1819,7 +1744,14 @@ async def _run_scan_pipeline(
         visited_discovery_origins.add(origin)
         round_number = len(origin_discovery_rounds) + 1
         stage_name = f"API Origin Discovery Round {round_number}"
-        await emit(stage_name, "running", f"Scanning authorized origin {origin}.")
+        await emit(
+            stage_name,
+            "running",
+            (
+                f"Scanning JavaScript-discovered origin {origin} independently "
+                "of the routes observed in JavaScript."
+            ),
+        )
         origin_results = []
         try:
             origin_outcome = await asyncio.to_thread(
@@ -1877,7 +1809,8 @@ async def _run_scan_pipeline(
                     "stage": stage_name,
                     "status": "completed",
                     "detail": (
-                        f"Kiterunner scanned {origin_target}; "
+                        f"Kiterunner scanned the base origin {origin_target} "
+                        "independently of JavaScript route seeds; "
                         f"{origin_result_count} parsed result(s), "
                         f"exit code {origin_exit_code if origin_exit_code is not None else 'not reported'}; "
                         f"command={origin_command!r}."
@@ -2030,40 +1963,7 @@ async def _run_scan_pipeline(
             "target_origins": eligible_origins,
         }
     )
-    discovered_origins = set()
-    for record in file_result.get("results", []):
-        if not isinstance(record, dict):
-            continue
-        evidence = record.get("evidence")
-        has_api_base_evidence = any(
-            isinstance(entry, dict)
-            and isinstance(entry.get("snippet"), str)
-            and re.search(
-                r"(?i)\b(?:api[_-]?(?:base|url)|base[_-]?url)\b",
-                entry["snippet"],
-            )
-            for entry in (evidence if isinstance(evidence, list) else [])
-        )
-        if (
-            record.get("is_api_endpoint") is not True
-            and not has_api_base_evidence
-            and not _javascript_root_origin(record)
-        ):
-            continue
-        candidate_url = record.get("url")
-        if record.get("resolved_url") or record.get("verification_url"):
-            candidate_url = record.get("resolved_url") or record.get("verification_url")
-        if not isinstance(candidate_url, str):
-            continue
-        try:
-            parts = urlsplit(candidate_url)
-            if parts.scheme and parts.netloc:
-                candidate_origin = _normalized_scope_origin(
-                    urlunsplit((parts.scheme, parts.netloc, "", "", ""))
-                )
-                discovered_origins.add(candidate_origin)
-        except (ValueError, HTTPException):
-            continue
+    discovered_origins = _discovered_url_origins(file_result)
     authorized_candidates = sorted(
         {origin for origin, _ in seed_batches}
         | (discovered_origins & set(authorized_origins))
@@ -2074,25 +1974,15 @@ async def _run_scan_pipeline(
             "stage": "API Origin Candidates",
             "status": "completed",
             "detail": (
-                f"Authorized candidates: {', '.join(authorized_candidates) or 'none'}. "
-                f"Out-of-scope candidates ignored: "
+                f"Discovered URL origins normalized to base origins. "
+                f"Authorized origins queued: {', '.join(authorized_candidates) or 'none'}. "
+                f"Out-of-scope origins ignored: "
                 f"{', '.join(out_of_scope_candidates) or 'none'}."
             ),
             "authorized_candidates": authorized_candidates,
             "ignored_candidates": out_of_scope_candidates,
         }
     )
-    if gateway_config_error:
-        await emit(
-            {
-                "stage": "Legacy Gateway Configuration",
-                "status": "warning",
-                "detail": (
-                    f"Ignored invalid MICROSCAN_GATEWAY_TARGET: {gateway_config_error} "
-                    "The per-scan authorized scope remains in effect."
-                ),
-            }
-        )
     queue = []
     remaining_initial_budget = limits.max_seeds_per_round * limits.max_rounds
     initial_seed_count = sum(len(paths) for _, paths in seed_batches)
@@ -2435,7 +2325,6 @@ async def _run_scan_pipeline(
 
     security_target = _api_candidate_security_target(
         normalized_target,
-        gateway_target,
         authorized_origins,
         kiterunner_results
         + seeded_results
@@ -2450,7 +2339,7 @@ async def _run_scan_pipeline(
         kiterunner_results + seeded_results,
         file_result.get("results", []),
         normalized_target,
-        gateway_target,
+        normalized_target,
         frontend_page_scanned=bool(file_result.get("page_sources")),
         security_target=security_target,
     )

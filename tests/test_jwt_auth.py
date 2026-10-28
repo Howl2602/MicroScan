@@ -378,7 +378,7 @@ class SigninTests(unittest.TestCase):
         self.assertEqual(candidates[0]["method"], "POST")
         self.assertEqual(candidates[0]["allow_header_methods"], ["POST"])
 
-    def test_405_without_allow_does_not_invent_login_method(self):
+    def test_login_get_405_becomes_bounded_post_candidate(self):
         candidates = EndpointSelector.discover_login_candidates(
             [
                 {
@@ -386,11 +386,143 @@ class SigninTests(unittest.TestCase):
                     "path": "/api/auth/login",
                     "status_code": 405,
                     "sources": ["kiterunner"],
-                }
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/auth/register",
+                    "status_code": 405,
+                    "sources": ["kiterunner"],
+                },
             ]
         )
 
-        self.assertEqual(candidates, [])
+        self.assertEqual([item["path"] for item in candidates], ["/api/auth/login"])
+        self.assertEqual(candidates[0]["method"], "POST")
+        self.assertTrue(candidates[0]["inferred_post_from_get_405"])
+
+    def test_get_405_fills_incomplete_observed_javascript_login_contract(self):
+        candidates = EndpointSelector.discover_login_candidates(
+            [
+                {
+                    "method": "POST",
+                    "path": "/api/auth/login",
+                    "sources": ["javascript"],
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/auth/login",
+                    "status_code": 405,
+                    "sources": ["kiterunner"],
+                },
+            ]
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["method"], "POST")
+        self.assertEqual(candidates[0]["evidence_source"], ["javascript"])
+        self.assertTrue(candidates[0]["inferred_post_from_get_405"])
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "lab-user",
+            "MICROSHIELD_PASSWORD": "lab-password",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    def test_get_405_login_infers_one_json_post_only_when_loopback_is_allowed(
+        self, _load
+    ):
+        discovered = [
+            {
+                "method": "POST",
+                "path": "/api/auth/login",
+                "sources": ["javascript"],
+            },
+            {
+                "method": "GET",
+                "path": "/api/auth/login",
+                "status_code": 405,
+                "sources": ["kiterunner"],
+            },
+            {
+                "method": "GET",
+                "path": "/api/auth/register",
+                "status_code": 405,
+                "sources": ["kiterunner"],
+            },
+        ]
+
+        config, candidates, note = Signin.configured_auth(
+            discovered,
+            allow_inferred_credentials=True,
+        )
+
+        self.assertEqual(candidates[0]["path"], "/api/auth/login")
+        self.assertEqual(config["method"], "POST")
+        self.assertEqual(config["login_endpoint"], "/api/auth/login")
+        self.assertEqual(
+            config["payload"],
+            {"username": "lab-user", "password": "lab-password"},
+        )
+        self.assertTrue(
+            config["_candidate_configurations"]["/api/auth/login"][
+                "inferred_from_get_405"
+            ]
+        )
+        self.assertIsNone(note)
+
+        blocked_config, _, blocked_note = Signin.configured_auth(discovered)
+        self.assertIsNone(blocked_config)
+        self.assertIn("evidence-supported request format", blocked_note)
+
+    @patch.dict(
+        os.environ,
+        {
+            "MICROSHIELD_USERNAME": "lab-user",
+            "MICROSHIELD_PASSWORD": "lab-password",
+        },
+        clear=True,
+    )
+    @patch.object(Signin, "load_environment")
+    @patch("module.signin.httpx.post")
+    def test_inferred_405_login_posts_single_json_credential_pair(
+        self, post, _load
+    ):
+        post.return_value = httpx.Response(
+            200,
+            json={"access_token": "test-token", "token_type": "Bearer"},
+            request=httpx.Request(
+                "POST", "http://127.0.0.1:8085/api/auth/login"
+            ),
+        )
+        discovered = [
+            {
+                "method": "GET",
+                "path": "/api/auth/login",
+                "status_code": 405,
+                "sources": ["kiterunner"],
+            }
+        ]
+        config, _, _ = Signin.configured_auth(
+            discovered,
+            allow_inferred_credentials=True,
+        )
+
+        result = Signin().signin("http://127.0.0.1:8085", config)
+
+        post.assert_called_once()
+        self.assertEqual(
+            post.call_args.args[0],
+            "http://127.0.0.1:8085/api/auth/login",
+        )
+        self.assertEqual(
+            post.call_args.kwargs["json"],
+            {"username": "lab-user", "password": "lab-password"},
+        )
+        self.assertTrue(result["token"])
+        self.assertNotIn("lab-password", json.dumps(result))
 
     @patch("module.signin.httpx.post")
     def test_cookie_only_login_result_is_supported(self, post):

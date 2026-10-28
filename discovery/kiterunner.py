@@ -34,19 +34,30 @@ class KiteRunner:
         if any(ch.isspace() for ch in candidate):
             raise ValueError("Target must not contain whitespace.")
 
-        if "//" not in candidate and ":" in candidate and not candidate.startswith(("http://", "https://")):
-            candidate = f"http://{candidate}"
         if "://" not in candidate:
             candidate = f"http://{candidate}"
 
-        parsed = urlsplit(candidate)
-        if parsed.scheme not in {"http", "https"} or not (parsed.netloc or parsed.path):
+        try:
+            parsed = urlsplit(candidate)
+            parsed.port
+        except ValueError as exc:
+            raise ValueError("Target must be a valid http:// or https:// origin.") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
             raise ValueError("Target must be a valid http:// or https:// URL.")
 
-        host = parsed.netloc or parsed.path.split("/", 1)[0]
-        if not host:
-            raise ValueError("Target is missing a host or port.")
-        return host
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    @staticmethod
+    def _command_target(normalized_target):
+        return urlsplit(normalized_target).netloc
 
     def _parse_json_lines(self, output):
         results = []
@@ -98,7 +109,7 @@ class KiteRunner:
         command = [
             self.executable,
             "scan",
-            normalized_target,
+            self._command_target(normalized_target),
             f"-A=apiroutes-260227:{limit}",
             "-x", "3",
             "-j", "1",
@@ -228,7 +239,7 @@ class KiteRunner:
             command = [
                 self.executable,
                 "scan",
-                normalized_target,
+                self._command_target(normalized_target),
                 "-w",
                 str(seed_wordlist),
                 f"-A=apiroutes-260227:{route_limit}",

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html
+import ipaddress
 import inspect
 import re
 import time
@@ -105,11 +106,16 @@ def normalize_origin(target: str) -> str:
         raise ValueError("Credentials in target URLs are not allowed.")
 
     hostname = parsed.hostname.rstrip(".").lower()
-    if hostname not in {"localhost", "127.0.0.1", "::1"}:
-        raise ValueError("File Discovery is limited to localhost, 127.0.0.1, and ::1.")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    if port not in {3000, 8085}:
-        raise ValueError("File Discovery is limited to the lab ports 3000 and 8085.")
+    try:
+        is_loopback = hostname == "localhost" or ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        raise ValueError("File Discovery is limited to loopback targets.")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("Target must use a valid port.") from exc
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", "", ""))
 
 
@@ -772,50 +778,90 @@ class FileDiscovery:
                     endpoints[key] = item
 
             if gateway_origin:
-                gateway_calibration_url = urljoin(
-                    gateway_origin, f".microscan-missing-{uuid.uuid4().hex}"
+                page_origin = urlunsplit(
+                    (
+                        urlsplit(page_url).scheme,
+                        urlsplit(page_url).netloc,
+                        "",
+                        "",
+                        "",
+                    )
                 )
-                gateway_calibration = await limited_fetch(gateway_calibration_url)
-                gateway_fallback = (
-                    gateway_calibration.signature_for(gateway_calibration_url)
-                    if gateway_calibration.status_code is not None
-                    else None
-                )
+                calibrations = {}
                 for item in endpoints.values():
                     if (
                         "javascript" not in item["sources"]
-                        or not item.get("is_api_endpoint")
                         or item.get("is_template")
                         or not item.get("url")
                     ):
                         continue
                     endpoint_url = item["url"]
+                    try:
+                        parsed_endpoint = urlsplit(endpoint_url)
+                        endpoint_origin = (
+                            normalize_origin(
+                                urlunsplit(
+                                    (
+                                        parsed_endpoint.scheme,
+                                        parsed_endpoint.netloc,
+                                        "",
+                                        "",
+                                        "",
+                                    )
+                                )
+                            ).rstrip("/")
+                            if parsed_endpoint.scheme and parsed_endpoint.netloc
+                            else None
+                        )
+                    except ValueError:
+                        endpoint_origin = None
+
                     if item.get("relative_to_frontend"):
-                        if not gateway_origin:
-                            item["resolution_status"] = "unresolved"
-                            continue
-                        parsed = urlsplit(endpoint_url)
-                        gateway_url = urlunsplit(
+                        verification_origin = (
+                            endpoint_origin
+                            if endpoint_origin and endpoint_origin != page_origin
+                            else gateway_origin
+                        )
+                        parsed_path = urlsplit(endpoint_url).path or "/"
+                        verification_url = urlunsplit(
                             (
-                                urlsplit(gateway_origin).scheme,
-                                urlsplit(gateway_origin).netloc,
-                                parsed.path or "/",
+                                urlsplit(verification_origin).scheme,
+                                urlsplit(verification_origin).netloc,
+                                parsed_path,
                                 "",
                                 "",
                             )
                         )
+                    elif endpoint_origin:
+                        verification_origin = endpoint_origin
+                        verification_url = endpoint_url
                     else:
-                        gateway_url = endpoint_url
-                        if not _same_origin(gateway_url, gateway_origin):
-                            item["resolution_status"] = "unresolved"
-                            item["verification_status"] = "inconclusive"
-                            continue
-                    item["resolved_url"] = gateway_url
+                        continue
+
+                    if verification_origin not in calibrations:
+                        calibration_url = urljoin(
+                            verification_origin,
+                            f".microscan-missing-{uuid.uuid4().hex}",
+                        )
+                        calibration = await limited_fetch(calibration_url)
+                        calibrations[verification_origin] = (
+                            calibration.signature_for(calibration_url)
+                            if calibration.status_code is not None
+                            else None
+                        )
+                    gateway_fallback = calibrations[verification_origin]
+
+                    if not _same_origin(verification_url, verification_origin):
+                        item["resolution_status"] = "unresolved"
+                        item["verification_status"] = "inconclusive"
+                        continue
+                    item["resolved_url"] = verification_url
+                    item["resolved_origin"] = verification_origin
                     item["resolution_status"] = "resolved"
                     if item["method"] != "GET":
                         continue
-                    response = await limited_fetch(gateway_url)
-                    item["verification_url"] = gateway_url
+                    response = await limited_fetch(verification_url)
+                    item["verification_url"] = verification_url
                     item["verification_status"] = (
                         "inconclusive"
                         if response.error or response.redirected
@@ -824,7 +870,7 @@ class FileDiscovery:
                         else "not_found"
                         if response.status_code == 404
                         or gateway_fallback is not None
-                        and response.signature_for(gateway_url) == gateway_fallback
+                        and response.signature_for(verification_url) == gateway_fallback
                         else "inconclusive"
                         if response.content_type == "text/html"
                         else "verified"

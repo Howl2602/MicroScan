@@ -244,6 +244,7 @@ class EndpointSelector:
     @classmethod
     def discover_login_candidates(cls, discovered_endpoints):
         allow_methods_by_path = {}
+        inferred_post_login_routes = {}
         method_evidence_count = 0
         for endpoint in discovered_endpoints or []:
             if not isinstance(endpoint, dict):
@@ -266,6 +267,23 @@ class EndpointSelector:
                 status = response.get("sc") or response.get("status_code")
                 if status != 405:
                     continue
+                method = str(endpoint.get("method") or "").upper()
+                if method == "GET":
+                    segments = cls._path_segments(path)
+                    login_terms = {"login", "signin", "sign-in", "sign_in", "authenticate"}
+                    if (
+                        set(segments) & login_terms
+                        and not set(segments) & cls.REGISTRATION_PATH_SEGMENTS
+                    ):
+                        inferred_post_login_routes.setdefault(
+                            path.rstrip("/") or "/",
+                            {
+                                **endpoint,
+                                "method": "POST",
+                                "path": path.rstrip("/") or "/",
+                                "inferred_post_from_get_405": True,
+                            },
+                        )
                 headers = response.get("headers") or endpoint.get("headers") or {}
                 allow = (
                     response.get("allow")
@@ -286,7 +304,60 @@ class EndpointSelector:
 
         candidates = []
         exclusions = []
-        for index, endpoint in enumerate(discovered_endpoints or []):
+        candidate_endpoints = list(discovered_endpoints or [])
+        observed_post_by_path = {
+            (endpoint.get("path") or endpoint.get("discovered_path")).rstrip("/")
+            or "/": endpoint
+            for endpoint in candidate_endpoints
+            if isinstance(endpoint, dict)
+            and str(endpoint.get("method") or "").upper() == "POST"
+            and isinstance(
+                endpoint.get("path") or endpoint.get("discovered_path"),
+                str,
+            )
+        }
+        for path, inferred_endpoint in inferred_post_login_routes.items():
+            observed_endpoint = observed_post_by_path.get(path)
+            if observed_endpoint is None:
+                candidate_endpoints.append(inferred_endpoint)
+                continue
+            body_fields = observed_endpoint.get("request_body_fields")
+            has_request_contract = bool(
+                isinstance(body_fields, list)
+                and any(
+                    isinstance(field, str)
+                    and field.lower() in {"email", "login", "user", "username"}
+                    for field in body_fields
+                )
+                and any(
+                    isinstance(field, str)
+                    and field.lower() in {"pass", "passwd", "password"}
+                    for field in body_fields
+                )
+                and all(
+                    isinstance(field, str)
+                    and field.lower()
+                    in {
+                        "email",
+                        "login",
+                        "user",
+                        "username",
+                        "pass",
+                        "passwd",
+                        "password",
+                    }
+                    for field in body_fields
+                )
+                and observed_endpoint.get("request_content_type")
+                in {
+                    "application/json",
+                    "application/x-www-form-urlencoded",
+                    "multipart/form-data",
+                }
+            )
+            if not has_request_contract:
+                observed_endpoint["inferred_post_from_get_405"] = True
+        for index, endpoint in enumerate(candidate_endpoints):
             if not isinstance(endpoint, dict):
                 continue
             method = str(endpoint.get("method") or "").upper()
@@ -386,6 +457,9 @@ class EndpointSelector:
                     "multipart/form-data",
                 }
             )
+            inferred_post_from_get_405 = bool(
+                endpoint.get("inferred_post_from_get_405")
+            )
             path_allow_methods = allow_methods_by_path.get(path.rstrip("/") or "/", set())
             rank = (
                 0 if set(segments) & {"login", "signin", "sign-in", "sign_in"} else 1,
@@ -406,6 +480,7 @@ class EndpointSelector:
                         "request_content_type_evidence"
                     ),
                     "request_format_evidence": request_format_evidence,
+                    "inferred_post_from_get_405": inferred_post_from_get_405,
                     "allow_header_methods": sorted(path_allow_methods),
                     "_rank": rank,
                     "_index": index,

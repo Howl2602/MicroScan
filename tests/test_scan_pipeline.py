@@ -7,13 +7,19 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi.testclient import TestClient
 
-from app.main import RecursiveDiscoveryLimits, app
+from app.main import (
+    RecursiveDiscoveryLimits,
+    _authorized_discovered_origins,
+    _discovered_loopback_origins,
+    app,
+)
 from module.authentication_test import AuthenticationTest
 from module.signin import Signin
 
 
-FRONTEND = "http://localhost:3000"
-GATEWAY = "http://localhost:8085"
+FRONTEND = "http://localhost:5000"
+GATEWAY = FRONTEND
+SECONDARY_ORIGIN = "http://localhost:8085"
 
 
 def file_discovery_result():
@@ -65,8 +71,185 @@ class ScanPipelineTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
 
+    @patch.dict(
+        os.environ,
+        {"MICROSCAN_GATEWAY_TARGET": "http://localhost:8085"},
+        clear=True,
+    )
+    def test_scan_target_scheme_host_and_port_reach_each_pipeline_stage(self):
+        for target in (
+            "http://localhost:5000",
+            "http://localhost:9000",
+            "https://127.0.0.1:9443",
+        ):
+            with self.subTest(target=target), patch(
+                "app.main.Discovery.discover", return_value=[]
+            ) as kiterunner, patch(
+                "app.main.FileDiscovery.scan",
+                new_callable=AsyncMock,
+                return_value={"results": [], "page_sources": [], "summary": {}},
+            ) as file_scan, patch(
+                "app.main.Modules.analyze_endpoints", return_value=[]
+            ) as security_modules:
+                response = self.client.get("/scan", params={"target": target})
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["target"], target)
+            self.assertEqual(kiterunner.call_args, call(target, 1000))
+            self.assertEqual(file_scan.await_args.args[0], target)
+            self.assertEqual(file_scan.await_args.kwargs["gateway_target"], target)
+            self.assertEqual(security_modules.call_args.args[0], target)
+
+    def test_invalid_target_returns_a_clear_error_without_scanning(self):
+        with patch("app.main.Discovery.discover") as kiterunner:
+            response = self.client.get(
+                "/scan",
+                params={"target": "ftp://localhost:5000"},
+            )
+            streamed_response = self.client.get(
+                "/scan",
+                params={"target": "ftp://localhost:5000", "stream": "true"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("valid HTTP(S) origin", response.json()["detail"])
+        self.assertIn("valid HTTP(S) origin", streamed_response.text)
+        kiterunner.assert_not_called()
+
+    def test_loopback_api_evidence_is_added_without_manual_scope_input(self):
+        file_result = {
+            "results": [
+                {
+                    "url": f"{SECONDARY_ORIGIN}/api/orders",
+                    "method": "GET",
+                    "is_api_endpoint": True,
+                    "sources": ["javascript"],
+                }
+            ]
+        }
+        with patch("app.main.Discovery.discover", return_value=[]) as discovery, patch(
+            "app.main.FileDiscovery.scan",
+            new_callable=AsyncMock,
+            return_value=file_result,
+        ), patch(
+            "app.main.Discovery.discover_seeded",
+            return_value={"results": [], "exit_code": 0, "result_count": 0},
+        ) as seeded_scan, patch(
+            "app.main.Modules.analyze_endpoints", return_value=[]
+        ) as security_modules:
+            response = self.client.get("/scan", params={"target": FRONTEND})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            _discovered_loopback_origins(file_result, FRONTEND),
+            {SECONDARY_ORIGIN},
+        )
+        self.assertEqual(discovery.call_args_list[1].args[0], SECONDARY_ORIGIN)
+        seeded_scan.assert_called_once_with(SECONDARY_ORIGIN, ["/api/orders"], 100)
+        self.assertEqual(security_modules.call_args.args[0], SECONDARY_ORIGIN)
+        self.assertEqual(
+            response.json()["summary"]["authorized_scope"],
+            [FRONTEND, SECONDARY_ORIGIN],
+        )
+
+    def test_loopback_api_evidence_does_not_expand_remote_target_scope(self):
+        file_result = {
+            "results": [
+                {
+                    "url": f"{SECONDARY_ORIGIN}/api/orders",
+                    "method": "GET",
+                    "is_api_endpoint": True,
+                    "sources": ["javascript"],
+                }
+            ]
+        }
+        self.assertEqual(
+            _discovered_loopback_origins(file_result, "https://example.test"),
+            set(),
+        )
+
+    def test_discovered_urls_are_reduced_to_authorized_origins(self):
+        file_result = {
+            "results": [
+                {
+                    "url": "https://api.example.test/api/orders",
+                    "sources": ["html"],
+                },
+                {
+                    "url": "https://api.example.test/asdf",
+                    "sources": ["wordlist"],
+                },
+                {
+                    "url": "https://outside.invalid/api/orders",
+                    "sources": ["javascript"],
+                },
+                {
+                    "template": "/api/orders/${id}",
+                    "is_template": True,
+                    "url": None,
+                    "sources": ["javascript"],
+                },
+            ]
+        }
+
+        self.assertEqual(
+            _authorized_discovered_origins(
+                file_result,
+                ["https://api.example.test", FRONTEND],
+            ),
+            {"https://api.example.test"},
+        )
+
+    def test_verified_javascript_routes_are_tested_on_their_loopback_origin(self):
+        api_endpoint = {
+            "url": f"{SECONDARY_ORIGIN}/api/orders",
+            "resolved_url": f"{SECONDARY_ORIGIN}/api/orders",
+            "verification_url": f"{SECONDARY_ORIGIN}/api/orders",
+            "method": "GET",
+            "is_api_endpoint": True,
+            "classification": "api_endpoint",
+            "verification_status": "verified",
+            "status_code": 200,
+            "content_type": "application/json",
+            "sources": ["javascript", "gateway_verification"],
+            "evidence": [
+                {
+                    "source_url": f"{FRONTEND}/assets/app.js",
+                    "snippet": "fetch('http://localhost:8085/api/orders')",
+                }
+            ],
+        }
+        with patch("app.main.Discovery.discover", return_value=[]) as discovery, patch(
+            "app.main.FileDiscovery.scan",
+            new_callable=AsyncMock,
+            return_value={
+                "results": [api_endpoint],
+                "page_sources": [FRONTEND],
+                "summary": {},
+            },
+        ), patch(
+            "app.main.Discovery.discover_seeded",
+            return_value={"results": [], "exit_code": 0, "result_count": 0},
+        ), patch(
+            "app.main.Modules.analyze_endpoints",
+            side_effect=lambda target, endpoints, **kwargs: endpoints,
+        ) as security_modules:
+            response = self.client.get("/scan", params={"target": FRONTEND})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            SECONDARY_ORIGIN,
+            [call.args[0] for call in discovery.call_args_list],
+        )
+        self.assertEqual(security_modules.call_args.args[0], SECONDARY_ORIGIN)
+        self.assertEqual(
+            security_modules.call_args.args[1][0]["path"],
+            "/api/orders",
+        )
+        self.assertEqual(response.json()["security_target"], SECONDARY_ORIGIN)
+
     @patch.dict(os.environ, {"MICROSCAN_GATEWAY_TARGET": GATEWAY}, clear=True)
-    def test_main_scan_integrates_gateway_kiterunner_and_file_discovery(self):
+    def test_main_scan_uses_one_target_for_kiterunner_and_file_discovery(self):
         discovered = [
             {
                 "method": "GET",
@@ -99,10 +282,7 @@ class ScanPipelineTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(kiterunner.call_args_list[0], call(FRONTEND, 1000))
-        self.assertEqual(
-            kiterunner.call_args_list[1],
-            call(GATEWAY, 1000, True, 45),
-        )
+        self.assertEqual(kiterunner.call_count, 1)
         self.assertEqual(seeded_kiterunner.call_count, 2)
         self.assertEqual(
             seeded_kiterunner.call_args_list[0],
@@ -125,7 +305,7 @@ class ScanPipelineTests(unittest.TestCase):
         self.assertEqual(len(matching), 1)
         self.assertEqual(
             set(matching[0]["discovery_sources"]),
-            {"javascript"},
+            {"javascript", "kiterunner"},
         )
         self.assertEqual(matching[0]["verification_status"], "verified")
 
@@ -137,7 +317,7 @@ class ScanPipelineTests(unittest.TestCase):
         )
         self.assertEqual(
             users_record["sources"],
-            ["javascript", "gateway_verification"],
+            ["kiterunner", "javascript", "gateway_verification"],
         )
         self.assertEqual(users_record["url"], f"{FRONTEND}/api/users")
         orders_record = next(
@@ -153,7 +333,6 @@ class ScanPipelineTests(unittest.TestCase):
             {stage["stage"] for stage in payload["discovery_stages"]},
             {
                 "API Discovery",
-                "API Origin Discovery Round 1",
                 "File Discovery",
                 "Seeded API Discovery",
                 "Recursive Discovery Round 2",
@@ -172,22 +351,25 @@ class ScanPipelineTests(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {"MICROSCAN_GATEWAY_TARGET": GATEWAY}, clear=True)
-    def test_relative_api_seeds_execute_on_configured_gateway_and_are_recorded_in_history(self):
+    def test_relative_api_seeds_use_the_scan_target_and_are_recorded_in_history(self):
+        api_origin = SECONDARY_ORIGIN
         file_result = {
             "page_sources": [FRONTEND],
             "summary": {},
             "results": [
                 {
-                    "url": f"{GATEWAY}/",
-                    "discovered_url": f"{GATEWAY}/",
+                    "url": f"{api_origin}/",
+                    "discovered_url": f"{api_origin}/",
                     "method": "GET",
+                    "status_code": 404,
+                    "verification_status": "inconclusive",
                     "sources": ["javascript"],
                     "is_api_endpoint": False,
                     "evidence": [{"source_url": f"{FRONTEND}/app.js", "snippet": "baseURL"}],
                 },
                 {
                     "url": f"{FRONTEND}/api/orders",
-                    "resolved_url": f"{GATEWAY}/api/orders",
+                    "resolved_url": f"{api_origin}/api/orders",
                     "discovered_url": "/api/orders",
                     "method": "GET",
                     "relative_to_frontend": True,
@@ -198,7 +380,7 @@ class ScanPipelineTests(unittest.TestCase):
                 },
                 {
                     "url": f"{FRONTEND}/api/inventory",
-                    "resolved_url": f"{GATEWAY}/api/inventory",
+                    "resolved_url": f"{api_origin}/api/inventory",
                     "discovered_url": "/api/inventory",
                     "method": "GET",
                     "relative_to_frontend": True,
@@ -209,7 +391,7 @@ class ScanPipelineTests(unittest.TestCase):
                 },
                 {
                     "url": f"{FRONTEND}/api/auth/login",
-                    "resolved_url": f"{GATEWAY}/api/auth/login",
+                    "resolved_url": f"{api_origin}/api/auth/login",
                     "discovered_url": "/api/auth/login",
                     "method": "POST",
                     "relative_to_frontend": True,
@@ -234,7 +416,7 @@ class ScanPipelineTests(unittest.TestCase):
             ],
         }
         execution = {
-            "target": "localhost:8085",
+            "target": api_origin,
             "seed_count": 2,
             "exit_code": 0,
             "result_count": 1,
@@ -249,7 +431,7 @@ class ScanPipelineTests(unittest.TestCase):
         }
         with patch("app.main.DISCOVERY_LIMITS", RecursiveDiscoveryLimits(max_seeds_per_round=2)), patch(
             "app.main.Discovery.discover", return_value=[]
-        ), patch(
+        ) as kiterunner, patch(
             "app.main.FileDiscovery.scan",
             new_callable=AsyncMock,
             return_value=file_result,
@@ -262,18 +444,28 @@ class ScanPipelineTests(unittest.TestCase):
             response = self.client.get("/scan", params={"target": FRONTEND})
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(kiterunner.call_args_list[0].args[0], FRONTEND)
+        self.assertEqual(kiterunner.call_args_list[1].args[0], api_origin)
+        self.assertTrue(kiterunner.call_args_list[1].args[2])
+        origin_scan_stage = next(
+            stage
+            for stage in response.json()["discovery_stages"]
+            if stage["stage"] == "API Origin Discovery Round 1"
+        )
+        self.assertIn("base origin", origin_scan_stage["detail"])
+        self.assertIn("independently of JavaScript route seeds", origin_scan_stage["detail"])
         self.assertEqual(seeded_scan.call_count, 3)
         self.assertEqual(
             seeded_scan.call_args_list[0],
-            call(GATEWAY, ["/api/orders", "/api/inventory"], 100),
+            call(api_origin, ["/api/orders", "/api/inventory"], 100),
         )
         self.assertEqual(
             seeded_scan.call_args_list[1],
-            call(GATEWAY, ["/api/auth/login"], 100),
+            call(api_origin, ["/api/auth/login"], 100),
         )
         self.assertEqual(
             seeded_scan.call_args_list[2],
-            call(GATEWAY, ["/api/orders/1"], 100),
+            call(api_origin, ["/api/orders/1"], 100),
         )
         payload = response.json()
         stage = next(
@@ -281,7 +473,7 @@ class ScanPipelineTests(unittest.TestCase):
             if item["stage"] == "Seeded API Discovery"
         )
         self.assertEqual(stage["status"], "completed")
-        self.assertEqual(stage["target"], "localhost:8085")
+        self.assertEqual(stage["target"], api_origin)
         self.assertEqual(stage["seed_count"], 2)
         self.assertEqual(stage["exit_code"], 0)
         self.assertEqual(stage["result_count"], 1)
@@ -293,7 +485,7 @@ class ScanPipelineTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["security_input_endpoints"], 1)
         api_root = next(
             item for item in payload["discovery_results"]
-            if item.get("original_url") == f"{GATEWAY}/"
+            if item.get("original_url") == f"{api_origin}/"
         )
         self.assertFalse(api_root.get("is_api_endpoint", False))
 
@@ -435,7 +627,7 @@ class ScanPipelineTests(unittest.TestCase):
 
         login_discovery_records = []
 
-        def missing_valid_token(discovered):
+        def missing_valid_token(discovered, **_kwargs):
             login_discovery_records.extend(discovered)
             return None, [], "No configured valid-token credentials."
 
@@ -1110,7 +1302,7 @@ class ScanPipelineTests(unittest.TestCase):
         self.assertEqual(events[-1]["payload"]["summary"]["scan_mode"], "full")
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_trusted_local_profile_uses_gateway_without_manual_configuration(self):
+    def test_target_origin_is_used_without_gateway_configuration(self):
         with patch("app.main.Discovery.discover", return_value=[]), patch(
             "app.main.FileDiscovery.scan",
             new_callable=AsyncMock,
@@ -1133,7 +1325,7 @@ class ScanPipelineTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(file_scan.await_args.kwargs["verify_endpoints"])
-        self.assertEqual(file_scan.await_args.kwargs["gateway_target"], GATEWAY)
+        self.assertEqual(file_scan.await_args.kwargs["gateway_target"], FRONTEND)
         seeded_scan.assert_not_called()
         stage = next(
             item for item in response.json()["discovery_stages"]
@@ -1147,7 +1339,7 @@ class ScanPipelineTests(unittest.TestCase):
         {"MICROSCAN_GATEWAY_TARGET": "https://outside.invalid"},
         clear=True,
     )
-    def test_gateway_outside_authorized_scope_is_rejected_before_seed_scan(self):
+    def test_legacy_gateway_environment_does_not_expand_scan_scope(self):
         with patch("app.main.Discovery.discover", return_value=[]) as discovery, patch(
             "app.main.FileDiscovery.scan",
             new_callable=AsyncMock,
@@ -1169,11 +1361,10 @@ class ScanPipelineTests(unittest.TestCase):
         )
         self.assertEqual(stage["status"], "skipped")
         self.assertIn("no JavaScript/HTML API candidates", stage["detail"])
-        legacy_stage = next(
-            item for item in response.json()["discovery_stages"]
-            if item["stage"] == "Legacy Gateway Configuration"
+        self.assertEqual(
+            response.json()["summary"]["authorized_scope"],
+            [FRONTEND],
         )
-        self.assertIn("authorized local lab scope", legacy_stage["detail"])
 
     @patch.dict(os.environ, {"MICROSCAN_GATEWAY_TARGET": GATEWAY}, clear=True)
     def test_dynamic_templates_are_not_forwarded_as_seed_urls(self):
@@ -1274,7 +1465,7 @@ class ScanPipelineTests(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_explicit_per_scan_scope_runs_recursive_discovery_without_gateway_env(self):
+    def test_explicit_per_scan_scope_runs_recursive_discovery(self):
         file_result = {
             "results": [
                 {
@@ -1290,8 +1481,8 @@ class ScanPipelineTests(unittest.TestCase):
                     ],
                 },
                 {
-                    "url": f"{GATEWAY}/",
-                    "discovered_url": GATEWAY,
+                    "url": f"{SECONDARY_ORIGIN}/",
+                    "discovered_url": SECONDARY_ORIGIN,
                     "method": "GET",
                     "is_api_endpoint": False,
                     "sources": ["javascript"],
@@ -1334,7 +1525,7 @@ class ScanPipelineTests(unittest.TestCase):
                 "/scan",
                 params={
                     "target": FRONTEND,
-                    "scope_origins": [GATEWAY],
+                    "scope_origins": [SECONDARY_ORIGIN],
                 },
             )
 
@@ -1342,20 +1533,23 @@ class ScanPipelineTests(unittest.TestCase):
         self.assertEqual(initial_scan.call_args_list[0], call(FRONTEND, 1000))
         self.assertEqual(
             initial_scan.call_args_list[1],
-            call(GATEWAY, 1000, True, 45),
+            call(SECONDARY_ORIGIN, 1000, True, 45),
         )
-        self.assertEqual(file_scan.await_args.kwargs["gateway_target"], GATEWAY)
+        self.assertEqual(file_scan.await_args.kwargs["gateway_target"], FRONTEND)
         self.assertEqual(seeded_scan.call_count, 2)
         self.assertEqual(
             seeded_scan.call_args_list[0],
-            call(GATEWAY, ["/api/orders"], 100),
+            call(SECONDARY_ORIGIN, ["/api/orders"], 100),
         )
         self.assertEqual(
             seeded_scan.call_args_list[1],
-            call(GATEWAY, ["/api/orders/42"], 100),
+            call(SECONDARY_ORIGIN, ["/api/orders/42"], 100),
         )
         payload = response.json()
-        self.assertEqual(payload["summary"]["authorized_scope"], [FRONTEND, GATEWAY])
+        self.assertEqual(
+            payload["summary"]["authorized_scope"],
+            [FRONTEND, SECONDARY_ORIGIN],
+        )
         self.assertEqual(payload["summary"]["recursive_discovery_stop_reason"], "queue_empty")
         self.assertEqual(len(payload["summary"]["discovery_rounds"]), 2)
         self.assertEqual(
@@ -1413,7 +1607,14 @@ class ScanPipelineTests(unittest.TestCase):
                     "method": "GET",
                     "is_api_endpoint": True,
                     "sources": ["javascript"],
-                }
+                },
+                {
+                    "url": f"{external}/asdf",
+                    "discovered_url": f"{external}/asdf",
+                    "method": "GET",
+                    "is_api_endpoint": False,
+                    "sources": ["html"],
+                },
             ],
             "page_sources": [FRONTEND],
             "summary": {},
@@ -1442,11 +1643,11 @@ class ScanPipelineTests(unittest.TestCase):
         seeded_scan.assert_called_once_with(external, ["/api/orders"], 100)
         self.assertEqual(
             response.json()["summary"]["authorized_scope"],
-            [FRONTEND, GATEWAY, external],
+            [FRONTEND, external],
         )
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_trusted_local_profile_maps_relative_paths_without_manual_scope(self):
+    def test_relative_paths_use_the_entered_target_without_profile_mapping(self):
         file_result = {
             "results": [
                 {
@@ -1504,13 +1705,13 @@ class ScanPipelineTests(unittest.TestCase):
         )
         self.assertEqual(
             response.json()["summary"]["authorized_scope"],
-            [FRONTEND, GATEWAY],
+            [FRONTEND],
         )
         candidates = next(
             stage for stage in response.json()["discovery_stages"]
             if stage["stage"] == "API Origin Candidates"
         )
-        self.assertIn(GATEWAY, candidates["authorized_candidates"])
+        self.assertNotIn(SECONDARY_ORIGIN, candidates["authorized_candidates"])
         self.assertTrue(
             any(
                 record.get("template") == "/api/orders/${encodeURIComponent(id)}"
@@ -1904,10 +2105,10 @@ class ScanPipelineTests(unittest.TestCase):
         file_result = {
             "results": [
                 {
-                    "url": f"{FRONTEND}/api/orders",
-                    "discovered_url": "/api/orders",
+                    "url": f"{SECONDARY_ORIGIN}/api/orders",
+                    "resolved_url": f"{SECONDARY_ORIGIN}/api/orders",
+                    "discovered_url": f"{SECONDARY_ORIGIN}/api/orders",
                     "method": "GET",
-                    "relative_to_frontend": True,
                     "is_api_endpoint": True,
                     "sources": ["javascript"],
                 }
@@ -1928,6 +2129,7 @@ class ScanPipelineTests(unittest.TestCase):
                 "/scan",
                 params={
                     "target": FRONTEND,
+                    "scope_origins": [SECONDARY_ORIGIN],
                 },
             )
 

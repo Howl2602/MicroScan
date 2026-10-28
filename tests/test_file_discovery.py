@@ -219,6 +219,8 @@ class FileDiscoveryTests(unittest.TestCase):
 
         def handler(request):
             requests.append(str(request.url))
+            if request.url.path.startswith("/.microscan-missing-"):
+                return httpx.Response(404, content="missing")
             if request.url.port == 3000 and request.url.path == "/":
                 return httpx.Response(
                     200,
@@ -277,7 +279,11 @@ class FileDiscoveryTests(unittest.TestCase):
         self.assertEqual(api_call["method"], "GET")
         self.assertIn("fetch('/api/orders')", api_call["evidence"][0]["snippet"])
         self.assertFalse(literal_path["is_api_endpoint"])
-        self.assertFalse(literal_path.get("verification_url"))
+        self.assertEqual(
+            literal_path["verification_url"],
+            f"{GATEWAY.rstrip('/')}/api/inventory",
+        )
+        self.assertEqual(literal_path["verification_status"], "not_found")
         self.assertEqual(post_endpoint["method"], "POST")
         self.assertEqual(post_endpoint["resolved_url"], f"{GATEWAY.rstrip('/')}/api/login")
         self.assertEqual(post_endpoint["verification_status"], "discovered")
@@ -285,9 +291,76 @@ class FileDiscoveryTests(unittest.TestCase):
         self.assertFalse(any(url.endswith("/api/login") for url in requests))
         self.assertEqual(unresolved_route["classification"], "unresolved")
         self.assertFalse(unresolved_route["is_api_endpoint"])
-        self.assertFalse(unresolved_route.get("verification_url"))
+        self.assertEqual(
+            unresolved_route["verification_url"],
+            f"{GATEWAY.rstrip('/')}/dashboard",
+        )
+        self.assertEqual(unresolved_route["verification_status"], "not_found")
         self.assertNotIn(f"{FRONTEND.rstrip('/')}/api/orders", requests)
         self.assertIn(f"{GATEWAY.rstrip('/')}/api/orders", requests)
+
+    def test_javascript_urls_on_any_loopback_origin_are_verified(self):
+        requests = []
+
+        def handler(request):
+            requests.append(str(request.url))
+            if request.url.path.startswith("/.microscan-missing-"):
+                return httpx.Response(404, content="missing")
+            if request.url.port == 3000 and request.url.path == "/":
+                return httpx.Response(
+                    200,
+                    content='<script src="/app.js"></script>',
+                    headers={"content-type": "text/html"},
+                )
+            if request.url.port == 3000 and request.url.path == "/app.js":
+                return httpx.Response(
+                    200,
+                    content=(
+                        'const API_BASE = "http://localhost:8085"; '
+                        'fetch("/api/users"); '
+                        'fetch("/dashboard"); '
+                        'fetch("http://127.0.0.2:9090/status"); '
+                        'fetch("https://outside.invalid/api/private");'
+                    ),
+                    headers={"content-type": "application/javascript"},
+                )
+            if request.url.host == "localhost" and request.url.port == 8085:
+                if request.url.path.startswith("/.microscan-missing-"):
+                    return httpx.Response(404, content="missing")
+                return httpx.Response(
+                    200,
+                    json={"path": request.url.path},
+                    headers={"content-type": "application/json"},
+                )
+            if request.url.host == "127.0.0.2" and request.url.port == 9090:
+                if request.url.path.startswith("/.microscan-missing-"):
+                    return httpx.Response(404, content="missing")
+                return httpx.Response(
+                    200,
+                    json={"path": request.url.path},
+                    headers={"content-type": "application/json"},
+                )
+            raise AssertionError(f"Unexpected request URL: {request.url}")
+
+        result = asyncio.run(
+            FileDiscovery(httpx.MockTransport(handler)).scan(
+                FRONTEND,
+                wordlist="",
+                requests_per_second=5,
+                verify_endpoints=True,
+                gateway_target=FRONTEND,
+            )
+        )
+
+        verified_urls = {
+            item.get("verification_url")
+            for item in result["results"]
+            if item.get("verification_status") == "verified"
+        }
+        self.assertIn("http://localhost:8085/api/users", verified_urls)
+        self.assertIn("http://localhost:8085/dashboard", verified_urls)
+        self.assertIn("http://127.0.0.2:9090/status", verified_urls)
+        self.assertFalse(any("outside.invalid" in url for url in requests))
 
     def test_scan_preserves_login_contract_and_allow_header_for_405(self):
         script = """
@@ -397,12 +470,22 @@ class FileDiscoveryTests(unittest.TestCase):
         self.assertEqual(endpoint["status_code"], 200)
         self.assertEqual(endpoint["verification_status"], "not_found")
 
-    def test_out_of_scope_targets_are_rejected(self):
+    def test_loopback_targets_allow_any_valid_port(self):
+        for target, expected in (
+            ("http://localhost:9999", "http://localhost:9999/"),
+            ("http://127.0.0.1:49152", "http://127.0.0.1:49152/"),
+            ("http://127.0.0.2:49152", "http://127.0.0.2:49152/"),
+            ("https://[::1]:8443", "https://[::1]:8443/"),
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(normalize_origin(target), expected)
+
+    def test_invalid_targets_are_rejected(self):
         for target in (
             "https://example.invalid",
-            "http://localhost:9999",
             "http://192.0.2.1:3000",
-            "http://127.0.0.2:3000",
+            "http://128.0.0.2:3000",
+            "http://localhost:invalid",
         ):
             with self.subTest(target=target), self.assertRaises(ValueError):
                 normalize_origin(target)

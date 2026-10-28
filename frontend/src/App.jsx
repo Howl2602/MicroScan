@@ -36,7 +36,7 @@ import {
 } from '@mui/material'
 
 const drawerWidth = 240
-const backendUrl = 'http://localhost:8000'
+const apiBaseUrl = '/api'
 
 export function SidebarNavigation({ activePage, onNavigate }) {
   return (
@@ -103,7 +103,7 @@ function normalizeOrigin(value) {
   }
 }
 
-function mergeDiscoveryResults(fileResults, kiterunnerResults, gatewayTarget, scanResultsTarget) {
+function mergeDiscoveryResults(fileResults, kiterunnerResults, scanTarget, scanResultsTarget) {
   const merged = new Map()
   fileResults.forEach((item) => {
     const method =
@@ -115,8 +115,8 @@ function mergeDiscoveryResults(fileResults, kiterunnerResults, gatewayTarget, sc
     })
   })
 
-  const gatewayOrigin = normalizeOrigin(gatewayTarget)
-  if (!gatewayOrigin || gatewayOrigin !== normalizeOrigin(scanResultsTarget)) {
+  const targetOrigin = normalizeOrigin(scanTarget)
+  if (!targetOrigin || targetOrigin !== normalizeOrigin(scanResultsTarget)) {
     return [...merged.values()]
   }
 
@@ -126,8 +126,8 @@ function mergeDiscoveryResults(fileResults, kiterunnerResults, gatewayTarget, sc
 
     let url
     try {
-      url = new URL(path, `${gatewayOrigin}/`)
-      if (url.origin !== gatewayOrigin) return
+      url = new URL(path, `${targetOrigin}/`)
+      if (url.origin !== targetOrigin) return
       url.search = ''
       url.hash = ''
     } catch {
@@ -1213,10 +1213,9 @@ function ExecutiveSummary({ summary }) {
 }
 
 function App() {
-  const [target, setTarget] = useState('http://localhost:3000')
+  const [target, setTarget] = useState('')
   const [scanMode, setScanMode] = useState('standard')
   const scanAbortController = useRef(null)
-  const [additionalScopeOrigins, setAdditionalScopeOrigins] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
   const [scanResults, setScanResults] = useState([])
   const [scanResultsTarget, setScanResultsTarget] = useState('')
@@ -1234,8 +1233,6 @@ function App() {
   const [activePage, setActivePage] = useState('Dashboard')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [fileTarget, setFileTarget] = useState('http://localhost:3000')
-  const [gatewayTarget, setGatewayTarget] = useState('http://localhost:8085')
   const [useDefaultWordlist, setUseDefaultWordlist] = useState(true)
   const [customWordlist, setCustomWordlist] = useState('')
   const [requestsPerSecond, setRequestsPerSecond] = useState(2)
@@ -1270,7 +1267,7 @@ function App() {
   const runScan = async () => {
     const scanTarget = target.trim()
     if (!scanTarget) {
-      setError('Enter a valid target such as localhost:8085 or https://example.com.')
+      setError('Enter a valid HTTP(S) target URL, for example http://localhost:5000.')
       return
     }
 
@@ -1281,10 +1278,6 @@ function App() {
     scanAbortController.current = controller
 
     try {
-      const extraOrigins = additionalScopeOrigins
-        .split(/[\n,]+/)
-        .map((origin) => origin.trim())
-        .filter(Boolean)
       const scanParams = new URLSearchParams({
         target: scanTarget,
         num: '200',
@@ -1292,14 +1285,14 @@ function App() {
         scan_mode: scanMode,
         stream: 'true',
       })
-      extraOrigins.forEach((origin) => scanParams.append('scope_origins', origin))
       const response = await fetch(
-        `${backendUrl}/scan?${scanParams.toString()}`,
+        `${apiBaseUrl}/scan?${scanParams.toString()}`,
         { signal: controller.signal }
       )
 
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`)
+        const payload = await response.json().catch(() => null)
+        throw new Error(payload?.detail || `HTTP ${response.status}`)
       }
 
       const reader = response.body?.getReader()
@@ -1432,22 +1425,28 @@ function App() {
   }
 
   const runFileDiscovery = async () => {
+    const scanTarget = target.trim()
+    if (!scanTarget) {
+      setFileDiscoveryError('Enter a valid HTTP(S) target URL on the Scan page first.')
+      return
+    }
+
     setFileDiscoveryLoading(true)
     setFileDiscoveryError('')
 
     try {
-      const response = await fetch(`${backendUrl}/file-discovery`, {
+      const response = await fetch(`${apiBaseUrl}/file-discovery`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          target: fileTarget.trim(),
+          target: scanTarget,
           wordlist: useDefaultWordlist ? null : customWordlist,
           requests_per_second: Number(requestsPerSecond),
           timeout: Number(fileTimeout),
           concurrency: Number(fileConcurrency),
           analyze_javascript: true,
           verify_endpoints: verifyEndpoints,
-          gateway_target: verifyEndpoints ? gatewayTarget.trim() : null,
+          gateway_target: verifyEndpoints ? scanTarget : null,
         }),
       })
       const payload = await response.json()
@@ -1473,7 +1472,7 @@ function App() {
   const mergedFileResults = mergeDiscoveryResults(
     fileDiscoveryResults,
     includeKiterunner ? scanResults : [],
-    gatewayTarget,
+    target,
     scanResultsTarget,
   )
   const visibleFileResults = filterDiscoveryResults(
@@ -1624,7 +1623,7 @@ function App() {
             <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
               <Box
                 component="input"
-                placeholder="localhost:8085"
+                placeholder="http://localhost:5000"
                 value={target}
                 onChange={(event) => setTarget(event.target.value)}
                 sx={{
@@ -1664,45 +1663,9 @@ function App() {
                 endpoint eligibility, and per-module safety limits still apply.
               </Typography>
 
-              <Box
-                component="details"
-                sx={{ flexBasis: '100%', mt: 1, color: 'text.secondary' }}
-              >
-                <Box component="summary" sx={{ cursor: 'pointer' }}>
-                  Advanced settings
-                </Box>
-                <Typography sx={{ mt: 1, mb: 1 }} variant="body2">
-                  Additional origins you are authorized to scan (optional, comma or newline separated).
-                </Typography>
-                <Box
-                  component="textarea"
-                  value={additionalScopeOrigins}
-                  onChange={(event) => setAdditionalScopeOrigins(event.target.value)}
-                  placeholder="https://api.example.test"
-                  rows={2}
-                  aria-label="Additional authorized scan origins"
-                  sx={{
-                    boxSizing: 'border-box',
-                    width: '100%',
-                    maxWidth: 700,
-                    p: 1.5,
-                    borderRadius: 1,
-                    border: '1px solid #334155',
-                    backgroundColor: '#111827',
-                    color: '#E5E7EB',
-                    font: 'inherit',
-                  }}
-                />
-                <Typography variant="caption" display="block" sx={{ mt: 1 }}>
-                  Recursion and request limits are enforced by the backend. Discovered origins never
-                  expand the authorized scope.
-                </Typography>
-              </Box>
-
               <Typography sx={{ flexBasis: '100%' }} color="text.secondary" variant="body2">
-                {target.includes('localhost') || target.includes('127.0.0.1') || target.includes('::1')
-                  ? 'Scanning configured local lab scope.'
-                  : 'Scanning the entered origin; discovered origins will not expand scope.'}
+                URLs found in JavaScript that point to loopback services may be scanned
+                automatically. Other hosts are not scanned automatically.
               </Typography>
 
               <Box
@@ -1852,22 +1815,12 @@ function App() {
                   Discovery scope and limits
                 </Typography>
                 <Typography color="text.secondary" variant="body2" sx={{ mb: 2 }}>
-                  Requests are restricted to localhost on lab ports 3000 and 8085. The frontend
-                  target is used to read HTML and same-origin scripts. Gateway verification is
-                  optional and uses the Gateway origin entered below. Redirects are not followed.
+                  The Scan target URL is used for discovery and endpoint verification without
+                  changing its scheme, host, or port. File Discovery remains restricted to
+                  localhost, 127.0.0.1, and ::1. Redirects are not followed.
                 </Typography>
 
                 <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
-                  <Box>
-                    <Typography variant="body2" sx={{ mb: 0.5 }}>Frontend target URL</Typography>
-                    <Box
-                      component="input"
-                      value={fileTarget}
-                      onChange={(event) => setFileTarget(event.target.value)}
-                      placeholder="http://localhost:3000"
-                      sx={{ width: '100%', boxSizing: 'border-box', px: 1.5, py: 1.2, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB' }}
-                    />
-                  </Box>
                   <FormControl fullWidth size="small">
                     <InputLabel id="file-wordlist-label">Wordlist</InputLabel>
                     <Select
@@ -1908,26 +1861,14 @@ function App() {
                 <FormControlLabel
                   sx={{ display: 'flex', mt: 1 }}
                   control={<Checkbox checked={verifyEndpoints} onChange={(event) => setVerifyEndpoints(event.target.checked)} />}
-                  label="Verify JavaScript endpoints on the Gateway (GET only)"
+                  label="Verify discovered endpoints on the scan target (GET only)"
                 />
-                {verifyEndpoints && (
-                  <Box sx={{ mt: 1, maxWidth: 520 }}>
-                    <Typography variant="body2" sx={{ mb: 0.5 }}>Gateway target URL</Typography>
-                    <Box component="input" value={gatewayTarget} onChange={(event) => setGatewayTarget(event.target.value)} placeholder="http://localhost:8085" sx={{ width: '100%', boxSizing: 'border-box', px: 1.5, py: 1.2, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB' }} />
-                  </Box>
-                )}
 
                 <FormControlLabel
                   sx={{ display: 'flex', mt: 1 }}
                   control={<Checkbox checked={includeKiterunner} onChange={(event) => setIncludeKiterunner(event.target.checked)} />}
                   label="Include results from the current Kiterunner scan"
                 />
-                {includeKiterunner && normalizeOrigin(target) !== normalizeOrigin(gatewayTarget) && (
-                  <Alert severity="info" sx={{ mt: 1 }}>
-                    Kiterunner results are included only when the current Scan target and Gateway target have the same origin.
-                  </Alert>
-                )}
-
                 <Box component="button" disabled={fileDiscoveryLoading} onClick={runFileDiscovery} sx={{ mt: 2, px: 3, py: 1.5, border: 'none', borderRadius: 1, backgroundColor: fileDiscoveryLoading ? '#475569' : 'primary.main', color: '#0B1120', fontWeight: 700, cursor: fileDiscoveryLoading ? 'default' : 'pointer', display: 'flex', alignItems: 'center', gap: 1 }}>
                   {fileDiscoveryLoading && <CircularProgress size={16} color="inherit" />}
                   {fileDiscoveryLoading ? 'DISCOVERING...' : 'START FILE DISCOVERY'}
@@ -2300,11 +2241,11 @@ function App() {
                 Restrict the target to an authorized host, and discover endpoints using Kiterunner.
               </Typography>
 
-              <Typography sx={{ mb: 1 }}>Default target</Typography>
+              <Typography sx={{ mb: 1 }}>Scan target URL</Typography>
               <Box
                 component="input"
                 value={target}
-                placeholder="localhost:8085"
+                placeholder="http://localhost:5000"
                 onChange={(event) => setTarget(event.target.value)}
                 sx={{
                   boxSizing: 'border-box',

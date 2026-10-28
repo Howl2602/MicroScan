@@ -39,14 +39,16 @@ class KiterunnerSeedScanTests(unittest.TestCase):
         self.assertEqual(seed_file_contents, ["/api/orders\n/api/inventory\n"])
         self.assertEqual(len(commands), 2)
         scan_command = commands[1]
-        self.assertEqual(scan_command[1:3], ["scan", "localhost:8085"])
+        self.assertEqual(
+            scan_command[1:3], ["scan", "localhost:8085"]
+        )
         self.assertIn("-A=apiroutes-260227:100", scan_command)
         self.assertIn("--force-method", scan_command)
         self.assertEqual(scan_command[scan_command.index("--force-method") + 1], "GET")
         self.assertEqual(scan_command[scan_command.index("--max-redirects") + 1], "0")
         self.assertTrue(scan_command[scan_command.index("-w") + 1].endswith("seeds.kite"))
         self.assertEqual(outcome["results"][0]["discovery_phase"], "seeded")
-        self.assertEqual(outcome["target"], "localhost:8085")
+        self.assertEqual(outcome["target"], "http://localhost:8085")
         self.assertEqual(outcome["seed_count"], 2)
         self.assertEqual(outcome["exit_code"], 0)
         self.assertEqual(outcome["result_count"], 1)
@@ -62,6 +64,33 @@ class KiterunnerSeedScanTests(unittest.TestCase):
         self.assertEqual(outcome["seed_count"], 0)
         self.assertIsNone(outcome["exit_code"])
         run.assert_not_called()
+
+    def test_target_normalization_preserves_https_and_custom_port(self):
+        self.assertEqual(
+            KiteRunner()._normalize_target("https://localhost:9000"),
+            "https://localhost:9000",
+        )
+        self.assertEqual(
+            KiteRunner()._command_target("https://localhost:9000"),
+            "localhost:9000",
+        )
+
+    @patch("discovery.kiterunner.subprocess.run")
+    def test_regular_scan_passes_kiterunner_host_without_url_scheme(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            ["kr.exe", "scan", "localhost:8085"], 0, "", ""
+        )
+
+        outcome = KiteRunner().kiterunner_scan(
+            "http://localhost:8085",
+            1000,
+            return_outcome=True,
+        )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[1:3], ["scan", "localhost:8085"])
+        self.assertEqual(outcome["target"], "http://localhost:8085")
+        self.assertEqual(outcome["command"], command)
 
     @patch("discovery.kiterunner.subprocess.run")
     def test_seeded_scan_failure_reports_command_exit_and_diagnostics(self, run):

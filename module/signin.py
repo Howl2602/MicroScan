@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import logging
 import os
 import re
@@ -59,6 +60,20 @@ class Signin:
         return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
     @classmethod
+    def is_loopback_target(cls, target):
+        try:
+            hostname = urlsplit(cls.normalize_target(target)).hostname
+            return bool(
+                hostname
+                and (
+                    hostname.lower() == "localhost"
+                    or ipaddress.ip_address(hostname).is_loopback
+                )
+            )
+        except (LoginConfigurationError, ValueError):
+            return False
+
+    @classmethod
     def discover_login_candidates(cls, discovered_endpoints):
         return EndpointSelector.discover_login_candidates(discovered_endpoints)
 
@@ -97,9 +112,13 @@ class Signin:
         return False
 
     @classmethod
-    def _credential_payloads(cls, username, password, candidates):
+    def _credential_payloads(
+        cls, username, password, candidates, allow_inferred_credentials=False
+    ):
         payloads = {}
         for candidate in candidates:
+            if candidate.get("inferred_post_from_get_405"):
+                continue
             fields = candidate.get("request_body_fields")
             content_type = candidate.get("request_content_type")
             if (
@@ -142,29 +161,60 @@ class Signin:
                 "payload": {username_key: username, password_key: password},
                 "content_type": content_type,
             }
+        if allow_inferred_credentials and not payloads:
+            inferred_candidate = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.get("inferred_post_from_get_405")
+                ),
+                None,
+            )
+            if inferred_candidate:
+                payloads[inferred_candidate["path"]] = {
+                    "payload": {
+                        "username": username,
+                        "password": password,
+                    },
+                    "content_type": "application/json",
+                    "inferred_from_get_405": True,
+                }
         return payloads
 
     @classmethod
-    def configured_auth(cls, discovered_endpoints):
+    def configured_auth(
+        cls, discovered_endpoints, allow_inferred_credentials=False
+    ):
         cls.load_environment()
         config = cls._parse_json_env("MICROSCAN_AUTH_CONFIG")
         legacy_payload = cls._parse_json_env("MICROSCAN_LOGIN_PAYLOAD")
         candidates = cls.discover_login_candidates(discovered_endpoints)
         username = os.environ.get("MICROSHIELD_USERNAME", "").strip()
         password = os.environ.get("MICROSHIELD_PASSWORD", "")
-        candidate_configurations = (
-            cls._credential_payloads(username, password, candidates)
-            if config is None
+        candidate_configurations = {}
+        if (
+            config is None
             and legacy_payload is None
             and username
             and password.strip()
-            else {}
-        )
+        ):
+            candidate_configurations = cls._credential_payloads(
+                username,
+                password,
+                candidates,
+                allow_inferred_credentials=allow_inferred_credentials,
+            )
         logger.info(
             "Login configuration evaluated | candidates=%d | "
-            "evidence_supported_contracts=%d | credentials_configured=%s",
+            "evidence_supported_contracts=%d | inferred_login_contracts=%d | "
+            "credentials_configured=%s",
             len(candidates),
             len(candidate_configurations),
+            sum(
+                1
+                for item in candidate_configurations.values()
+                if item.get("inferred_from_get_405")
+            ),
             bool(username and password.strip()),
         )
         credential_payload = (

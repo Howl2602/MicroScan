@@ -1436,6 +1436,9 @@ class AuthenticationTest:
                 "evidence_source": item.get("evidence_source", []),
                 "allow_header_methods": item.get("allow_header_methods", []),
                 "request_content_type": item.get("request_content_type"),
+                "inferred_post_from_get_405": item.get(
+                    "inferred_post_from_get_405", False
+                ),
             }
             for item in login_candidates
         ]
@@ -1482,7 +1485,10 @@ class AuthenticationTest:
         authenticated_headers = None
         try:
             auth_config, discovered_login_candidates, configuration_note = (
-                Signin.configured_auth(discovered_endpoints)
+                Signin.configured_auth(
+                    discovered_endpoints,
+                    allow_inferred_credentials=Signin.is_loopback_target(target),
+                )
             )
             discovery["discovered_login_endpoints"] = [
                 {
@@ -1492,6 +1498,9 @@ class AuthenticationTest:
                     "evidence_source": item.get("evidence_source", []),
                     "allow_header_methods": item.get("allow_header_methods", []),
                     "request_content_type": item.get("request_content_type"),
+                    "inferred_post_from_get_405": item.get(
+                        "inferred_post_from_get_405", False
+                    ),
                 }
                 for item in discovered_login_candidates
             ]
