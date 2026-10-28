@@ -116,8 +116,21 @@ function SectionCard({ id, title, children }) {
 
 function BulletList({ items }) {
   return (
-    <Box component="ul" sx={{ pl: 3, mb: 0, color: 'text.secondary', '& li': { mb: 1 } }}>
-      {items.map((item) => <li key={item}>{item}</li>)}
+    <Box component="ul" sx={{ listStyle: 'none', p: 0, m: 0 }}>
+      {items.map((item) => (
+        <Box
+          component="li"
+          key={item}
+          sx={{ display: 'flex', alignItems: 'flex-start', gap: 1, mb: 1, color: 'text.primary' }}
+        >
+          <Box component="span" aria-hidden="true" sx={{ flexShrink: 0 }}>
+            -
+          </Box>
+          <Box component="span" sx={{ color: 'text.primary' }}>
+            {item}
+          </Box>
+        </Box>
+      ))}
     </Box>
   )
 }

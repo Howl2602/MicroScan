@@ -4,6 +4,7 @@ import {
   filterDiscoveryResults,
   getApiMapPath,
 } from './apiMap.js'
+import { downloadReport } from './reportExport.js'
 import IntroductionPage from './IntroductionPage.jsx'
 
 import {
@@ -1229,6 +1230,7 @@ function App() {
   const [summary, setSummary] = useState({})
   const [selectedFinding, setSelectedFinding] = useState(null)
   const [scanCount, setScanCount] = useState(0)
+  const [reportDownloadError, setReportDownloadError] = useState('')
   const [activePage, setActivePage] = useState('Dashboard')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -1402,6 +1404,32 @@ function App() {
   }
 
   const cancelScan = () => scanAbortController.current?.abort()
+
+  const handleDownloadReport = () => {
+    try {
+      const report = {
+        target: scanResultsTarget || target,
+        scanCount,
+        summary,
+        findings,
+        scanStages,
+        discoveryResults: scanDiscoveryResults,
+        endpointAssessments,
+        bolaAssessments,
+        bolaBaselines,
+        bolaActiveTests,
+        fileDiscoveryError,
+      }
+      downloadReport(
+        report,
+        `microscan-report-${new Date().toISOString().slice(0, 10)}.html`,
+      )
+      setReportDownloadError('')
+    } catch (caughtError) {
+      console.error('Report download failed.', caughtError)
+      setReportDownloadError('The report could not be downloaded. Please try again.')
+    }
+  }
 
   const runFileDiscovery = async () => {
     setFileDiscoveryLoading(true)
@@ -2057,6 +2085,27 @@ function App() {
 
         {activePage === 'Reports' && (
           <Box>
+            <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 2 }}>
+              <Box
+                component="button"
+                type="button"
+                onClick={handleDownloadReport}
+                disabled={scanCount === 0}
+                sx={{
+                  ...reportButtonStyle,
+                  mt: 0,
+                  backgroundColor: scanCount === 0 ? 'transparent' : '#0F4C75',
+                  '&:disabled': { cursor: 'not-allowed', opacity: 0.55 },
+                }}
+              >
+                Download Report
+              </Box>
+            </Box>
+            {reportDownloadError && (
+              <Alert severity="error" sx={{ mb: 2 }}>
+                {reportDownloadError}
+              </Alert>
+            )}
             <Card>
               <CardContent>
                 <Typography color="text.secondary" variant="body2">
