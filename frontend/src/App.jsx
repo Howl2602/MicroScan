@@ -4,6 +4,7 @@ import {
   filterDiscoveryResults,
   getApiMapPath,
 } from './apiMap.js'
+import IntroductionPage from './IntroductionPage.jsx'
 
 import {
   Box,
@@ -11,6 +12,7 @@ import {
   List,
   ListItem,
   ListItemButton,
+  ListItemIcon,
   ListItemText,
   Toolbar,
   Typography,
@@ -34,6 +36,39 @@ import {
 
 const drawerWidth = 240
 const backendUrl = 'http://localhost:8000'
+
+export function SidebarNavigation({ activePage, onNavigate }) {
+  return (
+    <List sx={{ px: 1 }}>
+      {['Dashboard', 'Scan', 'API Map', 'Reports', 'Settings', 'Introduction'].map((page) => (
+        <ListItem key={page} disablePadding>
+          <ListItemButton
+            selected={activePage === page}
+            onClick={() => onNavigate(page)}
+            sx={{
+              borderRadius: 1,
+              mb: 0.5,
+              '&.Mui-selected': {
+                backgroundColor: '#1E293B',
+                color: '#38BDF8',
+              },
+              '&.Mui-selected:hover': {
+                backgroundColor: '#334155',
+              },
+            }}
+          >
+            {page === 'Introduction' && (
+              <ListItemIcon sx={{ minWidth: 34, color: 'inherit' }}>
+                <span aria-hidden="true">ⓘ</span>
+              </ListItemIcon>
+            )}
+            <ListItemText primary={page} />
+          </ListItemButton>
+        </ListItem>
+      ))}
+    </List>
+  )
+}
 
 class ApiMapErrorBoundary extends Component {
   state = { hasError: false }
@@ -1464,29 +1499,7 @@ function App() {
           </Typography>
         </Toolbar>
 
-        <List sx={{ px: 1 }}>
-          {['Dashboard', 'Scan', 'API Map', 'Reports', 'Settings'].map((page) => (
-            <ListItem key={page} disablePadding>
-              <ListItemButton
-                selected={activePage === page}
-                onClick={() => setActivePage(page)}
-                sx={{
-                  borderRadius: 1,
-                  mb: 0.5,
-                  '&.Mui-selected': {
-                    backgroundColor: '#1E293B',
-                    color: '#38BDF8',
-                  },
-                  '&.Mui-selected:hover': {
-                    backgroundColor: '#334155',
-                  },
-                }}
-              >
-                <ListItemText primary={page} />
-              </ListItemButton>
-            </ListItem>
-          ))}
-        </List>
+        <SidebarNavigation activePage={activePage} onNavigate={setActivePage} />
       </Drawer>
 
       <Box
@@ -1506,6 +1519,7 @@ function App() {
           {activePage === 'API Map' && 'API Endpoint Map'}
           {activePage === 'Reports' && 'Scan Reports'}
           {activePage === 'Settings' && 'Settings'}
+          {activePage === 'Introduction' && 'Introduction'}
         </Typography>
 
         <Typography sx={{ mb: 4, color: '#94A3B8' }}>
@@ -1515,6 +1529,7 @@ function App() {
           {activePage === 'API Map' && 'Visualize discovered API endpoints by path and HTTP method'}
           {activePage === 'Reports' && 'Review your previous scan results'}
           {activePage === 'Settings' && 'Configure your scanner'}
+          {activePage === 'Introduction' && 'Learn about API security and interpreting MicroScan results'}
         </Typography>
 
         {error && (
@@ -1522,6 +1537,8 @@ function App() {
             {error}
           </Alert>
         )}
+
+        {activePage === 'Introduction' && <IntroductionPage />}
 
         {activePage === 'Dashboard' && (
           <>

@@ -198,3 +198,62 @@ test('API Map excludes normalized not-found records by default and exposes audit
     2,
   )
 })
+
+test('Introduction navigation selects and opens the documentation page', async () => {
+  const server = await createServer({
+    configFile: fileURLToPath(new URL('../vite.config.js', import.meta.url)),
+    server: { middlewareMode: true },
+    appType: 'custom',
+    logLevel: 'silent',
+  })
+
+  try {
+    const { SidebarNavigation } = await server.ssrLoadModule('/src/App.jsx')
+    let selectedPage
+    const navigation = SidebarNavigation({
+      activePage: 'Dashboard',
+      onNavigate: (page) => { selectedPage = page },
+    })
+    const containsIntroductionLabel = (element) => {
+      if (!element || typeof element !== 'object') return false
+      if (Array.isArray(element)) return element.some(containsIntroductionLabel)
+      return element.props?.primary === 'Introduction' ||
+        containsIntroductionLabel(element.props?.children)
+    }
+    const findIntroductionButton = (element) => {
+      if (!element || typeof element !== 'object') return null
+      if (Array.isArray(element)) {
+        return element.map(findIntroductionButton).find(Boolean) ?? null
+      }
+      if (
+        typeof element.props?.onClick === 'function' &&
+        containsIntroductionLabel(element.props?.children)
+      ) return element
+      return findIntroductionButton(element.props?.children)
+    }
+
+    const introductionButton = findIntroductionButton(navigation)
+    assert.ok(introductionButton)
+    introductionButton.props.onClick()
+    assert.equal(selectedPage, 'Introduction')
+    const selectedNavigation = renderToStaticMarkup(createElement(SidebarNavigation, {
+      activePage: 'Introduction',
+      onNavigate: () => {},
+    }))
+    assert.match(selectedNavigation, /Mui-selected/)
+    assert.match(selectedNavigation, /Introduction/)
+
+    const { default: IntroductionPage } = await server.ssrLoadModule('/src/IntroductionPage.jsx')
+    const html = renderToStaticMarkup(createElement(IntroductionPage))
+    assert.match(html, /Broken Authentication \/ JWT/)
+    assert.match(html, /BOLA/)
+    assert.match(html, /Rate Limiting/)
+    assert.match(html, /Gateway Bypass/)
+    assert.match(html, /How to Read Results/)
+    assert.match(html, /OWASP API Security Top 10 2023/)
+    assert.match(html, /Severity/)
+    assert.match(html, /Confidence/)
+  } finally {
+    await server.close()
+  }
+})
