@@ -2339,6 +2339,13 @@ function App() {
                       summary={summary}
                     />
                   </Box>
+
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Gateway Bypass diagnostics
+                    </Box>
+                    <GatewayBypassResults report={gatewayBypass} />
+                  </Box>
                 </Box>
               </>
             )}
