@@ -57,6 +57,10 @@ Example allowlist:
 MICROSCAN_JWT_ENDPOINT_ALLOWLIST=[{"method":"GET","path":"/api/users/me"},{"method":"GET","path":"/api/orders/1"}]
 ```
 
+## Gateway Bypass checks
+
+The Scan pipeline includes a Gateway Bypass check using static `GET` routes from Endpoint Discovery. The input URL and all origins appearing in Discovery are treated as Gateway origins, and their ports are excluded from service candidates. Active checks are limited to loopback hosts (`localhost` or loopback IPs). Standard Scan checks up to 65 ports around the input Gateway port by default; Settings can override this with a range up to 10,000 ports. Full Scan checks ports `1-65535` automatically. TCP-open ports are not reported as services unless a Discovery-derived route or a shared prefix from repeated route patterns receives an HTTP/API response; prefixes are not guessed from unrelated routes. Standard Scan compares routes outside repeated identifier-like route families, while Full Scan compares every eligible discovered route. There is no per-scan endpoint comparison cap. Other methods, dynamic templates, and not-found routes are skipped. Port probes use batches of up to 2,048 ports, a concurrency limit of 512, and a 50 ms connect timeout; endpoint requests use a three-second timeout, no redirects, and a 64 KiB response evidence cap. Requests are anonymous; credentials are not copied from other modules. Raw response bodies are not retained; evidence contains a bounded JSON shape summary, response size, and SHA-256 fingerprint. If no service or comparable endpoint evidence is available, the result is `Inconclusive` with a reason. A confirmed result requires a Gateway access-denial signal and non-empty structured data from the direct service; status 200 by itself is insufficient.
+
 Install backend dependencies from the repository root with `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`. Copy `.env.example` to `.env` and replace the placeholders with authorized lab credentials (or set the environment variables in your shell). Do not commit `.env` or put credentials in reports:
 
 ```powershell

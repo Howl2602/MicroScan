@@ -31,6 +31,32 @@ test('exports all report sections and keeps the original report unchanged', () =
     bolaBaselines: [{ baseline_status: 'captured' }],
     bolaAssessments: [{ assessment: 'potential', evidence_summary: 'Bằng chứng đầy đủ' }],
     bolaActiveTests: [{ status: 'inconclusive', reason: 'Không đủ dữ liệu' }],
+    gatewayBypass: {
+      status: 'completed',
+      gateway_origins: [{ origin: 'http://localhost:8085', port: 8085 }],
+      excluded_service_origins: [],
+      services: [{
+        origin: 'http://localhost:8081',
+        port: 8081,
+        verification_status: 'verified',
+        verification_evidence: {
+          method: 'GET',
+          path: '/api/',
+          source: 'repeated_route_prefix',
+          status_code: 200,
+        },
+        endpoints: [{
+          status: 'confirmed',
+          method: 'GET',
+          path: '/api/orders/1',
+          reason: 'Gateway denied; direct service returned structured data.',
+          gateway: { response: { status_code: 403 } },
+          direct: { response: { status_code: 200 } },
+          comparison: { status_changed: true },
+        }],
+      }],
+      skipped_endpoints: [],
+    },
     fileDiscoveryError: '',
   }
   const original = structuredClone(report)
@@ -42,6 +68,14 @@ test('exports all report sections and keeps the original report unchanged', () =
   assert.match(html, /Ngoài phạm vi kiểm thử/)
   assert.match(html, /Bằng chứng đầy đủ/)
   assert.match(html, /Active BOLA tests/)
+  assert.match(html, /Gateway Bypass/)
+  assert.match(html, /http:\/\/localhost:8085/)
+  assert.match(html, /http:\/\/localhost:8081/)
+  assert.match(html, /Gateway and direct-service comparisons/)
+  assert.match(html, /\/api\/orders\/1/)
+  assert.match(html, /Gateway denied; direct service returned structured data\./)
+  assert.match(html, /repeated_route_prefix/)
+  assert.match(html, /status_changed/)
   assert.match(html, /Authorized endpoints/)
   assert.deepEqual(report, original)
 })

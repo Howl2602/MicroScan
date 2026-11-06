@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from app.logging_config import logger
 from discovery.file_discovery import DEFAULT_WORDLIST, FileDiscovery, normalize_origin
 from discovery.models import Discovery
+from module.gateway_bypass import GatewayBypass
 from module.modules import Modules
 from module.pentest_report import build_pentest_report
 from module.signin import LoginConfigurationError, Signin
@@ -1597,6 +1598,8 @@ async def _run_scan_pipeline(
     scope_origins=None,
     scan_mode="standard",
     cancel_event=None,
+    gateway_bypass_port_start=None,
+    gateway_bypass_port_end=None,
 ):
     if scan_mode not in {"standard", "full"}:
         raise ValueError("scan_mode must be either 'standard' or 'full'.")
@@ -2389,6 +2392,7 @@ async def _run_scan_pipeline(
             "bola_assessments": report["bola_assessments"],
             "bola_baselines": report["bola_baselines"],
             "bola_active_tests": report["bola_active_tests"],
+            "gateway_bypass": report["gateway_bypass"],
             "discovery_results": discovery_results,
             "discovery_stages": list(stages.values()),
             "discovery_errors": {
@@ -2472,6 +2476,7 @@ async def _run_scan_pipeline(
             "bola_assessments": report["bola_assessments"],
             "bola_baselines": report["bola_baselines"],
             "bola_active_tests": report["bola_active_tests"],
+            "gateway_bypass": report["gateway_bypass"],
             "discovery_results": discovery_results,
             "discovery_stages": list(stages.values()),
             "discovery_errors": {
@@ -2519,6 +2524,44 @@ async def _run_scan_pipeline(
         "completed",
         f"Input {len(endpoints_for_testing)} endpoint(s); selected {selected_count}; "
         f"actually tested {tested_count}; {request_count} request attempt(s).",
+    )
+    await emit(
+        "Gateway Bypass",
+        "running",
+        "Checking loopback ports against static GET endpoints from Discovery.",
+    )
+    try:
+        gateway_bypass = await GatewayBypass().analyze(
+            normalized_target,
+            discovery_results,
+            scan_mode=scan_mode,
+            port_start=gateway_bypass_port_start,
+            port_end=gateway_bypass_port_end,
+            progress_callback=emit,
+        )
+    except ValueError as exc:
+        gateway_bypass = {
+            "status": "error",
+            "reason": str(exc),
+            "services": [],
+            "skipped_endpoints": [],
+        }
+        logger.warning(
+            "Gateway Bypass configuration failed | error=%s", type(exc).__name__
+        )
+    await emit(
+        "Gateway Bypass",
+        gateway_bypass["status"],
+        gateway_bypass.get("reason")
+        or (
+            f"Verified {len(gateway_bypass.get('services', []))} loopback service "
+            "origin(s) using discovered endpoints."
+        ),
+    )
+    report = build_pentest_report(
+        analyzed,
+        scan_mode=scan_mode,
+        gateway_bypass=gateway_bypass,
     )
     _set_security_dispositions(
         discovery_results,
@@ -2804,6 +2847,7 @@ async def _run_scan_pipeline(
         "bola_assessments": report["bola_assessments"],
         "bola_baselines": report["bola_baselines"],
         "bola_active_tests": report["bola_active_tests"],
+        "gateway_bypass": report["gateway_bypass"],
         "discovery_results": discovery_results,
         "discovery_summary": file_result.get("summary", {}),
         "discovery_stages": list(stages.values()),
@@ -2882,6 +2926,8 @@ async def scan(
     scan_mode: str = "standard",
     stream: bool = False,
     scope_origins: list[str] = Query(default=[]),
+    gateway_bypass_port_start: int | None = None,
+    gateway_bypass_port_end: int | None = None,
 ):
     if not stream:
         try:
@@ -2891,6 +2937,8 @@ async def scan(
                 auto_jwt_local_lab,
                 scope_origins=scope_origins,
                 scan_mode=scan_mode,
+                gateway_bypass_port_start=gateway_bypass_port_start,
+                gateway_bypass_port_end=gateway_bypass_port_end,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2913,6 +2961,8 @@ async def scan(
                     scope_origins,
                     scan_mode,
                     cancel_event,
+                    gateway_bypass_port_start,
+                    gateway_bypass_port_end,
                 )
                 await queue.put(
                     {"type": "complete", "status_code": status, "payload": payload}

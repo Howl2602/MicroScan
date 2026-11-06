@@ -78,6 +78,33 @@ function renderSummary(summary) {
     .join('')}</tbody></table>`
 }
 
+function renderGatewayBypass(report = {}) {
+    const services = Array.isArray(report.services) ? report.services : []
+    const endpoints = services.flatMap((service) =>
+      (Array.isArray(service.endpoints) ? service.endpoints : []).map((endpoint) => ({
+        service,
+        endpoint,
+      })),
+    )
+    const endpointRows = endpoints.length
+      ? `<table><thead><tr><th>Service origin</th><th>Endpoint</th><th>Result</th><th>Reason</th><th>Gateway evidence</th><th>Direct-service evidence</th><th>Comparison</th></tr></thead><tbody>${endpoints
+        .map(({ service, endpoint }) =>
+          `<tr><td>${escapeHtml(service.origin ?? 'Not reported')}<br>Port ${escapeHtml(service.port ?? '—')}</td><td>${escapeHtml(endpoint.method ?? 'GET')} ${escapeHtml(endpoint.path ?? '/')}</td><td>${escapeHtml(endpoint.status ?? 'inconclusive')}</td><td>${escapeHtml(endpoint.reason ?? 'No reason reported.')}</td><td><pre>${formatValue(endpoint.gateway ?? {})}</pre></td><td><pre>${formatValue(endpoint.direct ?? {})}</pre></td><td><pre>${formatValue(endpoint.comparison ?? {})}</pre></td></tr>`,
+        )
+        .join('')}</tbody></table>`
+      : '<p>No Gateway/direct endpoint comparisons were reported.</p>'
+    const serviceRows = services.length
+      ? `<table><thead><tr><th>Service origin</th><th>Port</th><th>Verification</th></tr></thead><tbody>${services
+        .map(
+          (service) =>
+            `<tr><td>${escapeHtml(service.origin ?? 'Not reported')}</td><td>${escapeHtml(service.port ?? '—')}</td><td><pre>${formatValue(service.verification_evidence ?? service.verification_status ?? {})}</pre></td></tr>`,
+        )
+        .join('')}</tbody></table>`
+      : '<p>No verified service origins were reported.</p>'
+
+    return `<section><h2>Gateway Bypass</h2><p>Status: ${escapeHtml(report.status ?? 'not reported')}${report.reason ? ` — ${escapeHtml(report.reason)}` : ''}</p><p>Ports scanned: ${escapeHtml(report.ports_scanned ?? '—')}; open candidates: ${escapeHtml(report.open_ports_found ?? '—')}; endpoint comparisons: ${endpoints.length}.</p><h3>Gateway origins</h3>${renderRecords(report.gateway_origins, 'No Gateway origins were recorded from Discovery.')}<h3>Verified service origins</h3>${serviceRows}<h3>Gateway and direct-service comparisons</h3>${endpointRows}<h3>Excluded service-origin candidates</h3>${renderRecords(report.excluded_service_origins, 'No service-origin candidates were excluded.')}<h3>Skipped endpoints</h3>${renderRecords(report.skipped_endpoints, 'No discovered endpoints were skipped.')}</section>`
+}
+
 export function createReportHtml(report) {
   const safe = sanitizeReportData(report)
   const target = safe.target || 'Not reported'
@@ -121,6 +148,7 @@ export function createReportHtml(report) {
     <section><h2>Endpoint test cases and evidence</h2>${renderRecords(safe.endpointAssessments, 'No endpoint assessments were reported.')}</section>
     <section><h2>Passive BOLA assessments and baselines</h2>${renderRecords(safe.bolaBaselines, 'No BOLA baselines were reported.')}${renderRecords(safe.bolaAssessments, 'No passive BOLA assessments were reported.')}</section>
     <section><h2>Active BOLA tests</h2>${renderRecords(safe.bolaActiveTests, 'No active BOLA tests were reported.')}</section>
+    ${renderGatewayBypass(safe.gatewayBypass)}
   </main>
 </body>
 </html>`

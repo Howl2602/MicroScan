@@ -782,6 +782,102 @@ function VulnerabilityFindings({ findings }) {
   ))
 }
 
+function GatewayBypassResults({ report }) {
+  const services = Array.isArray(report?.services) ? report.services : []
+
+  return (
+    <Box sx={{ mt: 2 }}>
+      <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+        Gateway Bypass
+      </Typography>
+      {report?.reason && (
+        <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+          {report.reason}
+        </Typography>
+      )}
+      {report?.gateway_origins?.length > 0 && (
+        <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+          Input and Discovery origins treated as Gateway origins:{' '}
+          {report.gateway_origins
+            .map((origin) => `${origin.origin} (port ${origin.port})`)
+            .join(', ')}
+        </Typography>
+      )}
+      {report?.port_range && (
+        <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+          Port range {report.port_range.start}–{report.port_range.end}; scanned{' '}
+          {report.ports_scanned ?? 0} non-Gateway loopback ports.
+        </Typography>
+      )}
+      {report?.excluded_service_origins?.length > 0 && (
+        <Box component="details" sx={{ mt: 1 }}>
+          <Box component="summary" sx={{ cursor: 'pointer' }}>
+            Excluded service-origin candidates ({report.excluded_service_origins.length})
+          </Box>
+          <Box component="pre" sx={technicalEvidenceStyle}>
+            {JSON.stringify(report.excluded_service_origins, null, 2)}
+          </Box>
+        </Box>
+      )}
+      {services.length === 0 ? (
+        <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+          No verified service origins were found from Discovery routes or their
+          shared prefixes.
+        </Typography>
+      ) : (
+        services.map((service) => (
+          <Box
+            key={`${service.origin}-${service.port}`}
+            component="details"
+            sx={{ mt: 1.5, border: '1px solid #334155', borderRadius: 1, px: 1.5, py: 1 }}
+          >
+            <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 600 }}>
+              {service.origin} · port {service.port} · {service.verification_status}
+            </Box>
+            <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+              Verified from {service.verification_evidence?.method}{' '}
+              {service.verification_evidence?.path} · HTTP{' '}
+              {service.verification_evidence?.status_code ?? '—'} ·{' '}
+              {service.verification_evidence?.content_type ?? 'unknown content type'}
+              {service.verification_evidence?.source === 'repeated_route_prefix'
+                ? ' · shared route prefix'
+                : ''}
+            </Typography>
+            {(service.endpoints ?? []).map((endpoint, index) => (
+              <Box
+                key={`${endpoint.method}-${endpoint.path}-${index}`}
+                component="details"
+                sx={{ mt: 1, p: 1, borderTop: '1px solid #334155' }}
+              >
+                <Box component="summary" sx={{ cursor: 'pointer' }}>
+                  {endpoint.method} {endpoint.path} · {endpoint.status}
+                </Box>
+                <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+                  {endpoint.reason}
+                </Typography>
+                <Box component="pre" sx={technicalEvidenceStyle}>
+                  {JSON.stringify({
+                    comparison: endpoint.comparison,
+                    gateway: endpoint.gateway,
+                    direct: endpoint.direct,
+                  }, null, 2)}
+                </Box>
+              </Box>
+            ))}
+          </Box>
+        ))
+      )}
+      {report?.skipped_endpoints?.length > 0 && (
+        <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+          Skipped discovered endpoints: {report.skipped_endpoints
+            .map((endpoint) => `${endpoint.method} ${endpoint.path}: ${endpoint.reason}`)
+            .join(' · ')}
+        </Typography>
+      )}
+    </Box>
+  )
+}
+
 function findingDescription(name = '') {
   const normalized = name.toLowerCase()
   if (normalized.includes('bola') || normalized.includes('object level')) {
@@ -1215,6 +1311,8 @@ function ExecutiveSummary({ summary }) {
 function App() {
   const [target, setTarget] = useState('')
   const [scanMode, setScanMode] = useState('standard')
+  const [gatewayBypassPortStart, setGatewayBypassPortStart] = useState('')
+  const [gatewayBypassPortEnd, setGatewayBypassPortEnd] = useState('')
   const scanAbortController = useRef(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [scanResults, setScanResults] = useState([])
@@ -1226,6 +1324,7 @@ function App() {
   const [bolaAssessments, setBolaAssessments] = useState([])
   const [bolaBaselines, setBolaBaselines] = useState([])
   const [bolaActiveTests, setBolaActiveTests] = useState([])
+  const [gatewayBypass, setGatewayBypass] = useState({ status: 'not_run', services: [] })
   const [summary, setSummary] = useState({})
   const [selectedFinding, setSelectedFinding] = useState(null)
   const [scanCount, setScanCount] = useState(0)
@@ -1270,6 +1369,13 @@ function App() {
       setError('Enter a valid HTTP(S) target URL, for example http://localhost:5000.')
       return
     }
+    if (
+      scanMode === 'standard'
+      && Boolean(gatewayBypassPortStart.trim()) !== Boolean(gatewayBypassPortEnd.trim())
+    ) {
+      setError('Enter both the start and end port, or leave both blank for the default range.')
+      return
+    }
 
     setLoading(true)
     setError('')
@@ -1285,6 +1391,10 @@ function App() {
         scan_mode: scanMode,
         stream: 'true',
       })
+      if (gatewayBypassPortStart.trim() && gatewayBypassPortEnd.trim()) {
+        scanParams.set('gateway_bypass_port_start', gatewayBypassPortStart.trim())
+        scanParams.set('gateway_bypass_port_end', gatewayBypassPortEnd.trim())
+      }
       const response = await fetch(
         `${apiBaseUrl}/scan?${scanParams.toString()}`,
         { signal: controller.signal }
@@ -1347,6 +1457,7 @@ function App() {
       setBolaAssessments(payload.bola_assessments ?? [])
       setBolaBaselines(payload.bola_baselines ?? [])
       setBolaActiveTests(payload.bola_active_tests ?? [])
+      setGatewayBypass(payload.gateway_bypass ?? { status: 'not_run', services: [] })
       setSummary(payload.summary ?? {})
       setScanCount((count) => count + 1)
       setActivePage('Reports')
@@ -1367,6 +1478,7 @@ function App() {
         setBolaAssessments([])
         setBolaBaselines([])
         setBolaActiveTests([])
+        setGatewayBypass({ status: 'cancelled', services: [] })
         setSummary({
           scan_mode: scanMode,
           scan_status: 'cancelled',
@@ -1411,6 +1523,7 @@ function App() {
         bolaAssessments,
         bolaBaselines,
         bolaActiveTests,
+        gatewayBypass,
         fileDiscoveryError,
       }
       downloadReport(
@@ -1664,8 +1777,8 @@ function App() {
               </Typography>
 
               <Typography sx={{ flexBasis: '100%' }} color="text.secondary" variant="body2">
-                URLs found in JavaScript that point to loopback services may be scanned
-                automatically. Other hosts are not scanned automatically.
+                Gateway Bypass treats the input URL and all origins found in Discovery
+                as Gateway origins. Only loopback Gateway origins are actively checked.
               </Typography>
 
               <Box
@@ -1799,6 +1912,7 @@ function App() {
                   activeTests={bolaActiveTests}
                   summary={summary}
                 />
+                <GatewayBypassResults report={gatewayBypass} />
               </CardContent>
             </Card>
           </>
@@ -2260,6 +2374,76 @@ function App() {
                   fontSize: '1rem',
                 }}
               />
+
+              <Typography sx={{ mt: 3, mb: 1 }}>
+                Gateway Bypass port range for Standard Scan
+              </Typography>
+              <Box
+                sx={{
+                  display: 'flex',
+                  gap: 2,
+                  maxWidth: 500,
+                }}
+              >
+                <Box sx={{ width: '50%' }}>
+                  <Typography variant="caption">Start port</Typography>
+                  <Box
+                    component="input"
+                    type="number"
+                    min="1"
+                    aria-label="Gateway Bypass port range start"
+                    value={gatewayBypassPortStart}
+                    placeholder="Auto"
+                    disabled={scanMode === 'full'}
+                    onChange={(event) => setGatewayBypassPortStart(event.target.value)}
+                    sx={{
+                      boxSizing: 'border-box',
+                      width: '100%',
+                      px: 2,
+                      py: 1.5,
+                      borderRadius: 1,
+                      border: '1px solid #334155',
+                      backgroundColor: '#111827',
+                      color: '#E5E7EB',
+                      fontSize: '1rem',
+                    }}
+                  />
+                </Box>
+                <Box sx={{ width: '50%' }}>
+                  <Typography variant="caption">End port</Typography>
+                  <Box
+                    component="input"
+                    type="number"
+                    min="1"
+                    aria-label="Gateway Bypass port range end"
+                    value={gatewayBypassPortEnd}
+                    placeholder="Auto"
+                    disabled={scanMode === 'full'}
+                    onChange={(event) => setGatewayBypassPortEnd(event.target.value)}
+                    sx={{
+                      boxSizing: 'border-box',
+                      width: '100%',
+                      px: 2,
+                      py: 1.5,
+                      borderRadius: 1,
+                      border: '1px solid #334155',
+                      backgroundColor: '#111827',
+                      color: '#E5E7EB',
+                      fontSize: '1rem',
+                    }}
+                  />
+                </Box>
+              </Box>
+              <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+                Checks only localhost/loopback. The input URL and origins/ports found
+                in Discovery are treated as Gateways and excluded from service
+                candidates. Standard scans up to 65 ports around the input Gateway
+                port by default; enter both bounds for a custom range (up to 10,000
+                ports). Full scans ports 1–65535 automatically. Repeated
+                identifier-style routes contribute shared prefixes for service
+                verification; Standard compares other eligible routes, while Full
+                compares every eligible discovered route. No route-count cap applies.
+              </Typography>
 
               <Typography sx={{ mt: 3, mb: 1 }}>Discovery engine</Typography>
               <Chip label="Kiterunner" color="primary" variant="outlined" />

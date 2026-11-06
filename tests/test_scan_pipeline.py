@@ -343,6 +343,7 @@ class ScanPipelineTests(unittest.TestCase):
                 "JavaScript Analysis",
                 "Endpoint Correlation",
                 "Security Testing",
+                "Gateway Bypass",
             },
         )
         self.assertEqual(
@@ -1273,7 +1274,16 @@ class ScanPipelineTests(unittest.TestCase):
             "app.main.Discovery.discover_seeded", return_value=[]
         ), patch(
             "app.main.Modules.analyze_endpoints", return_value=[]
-        ):
+        ), patch(
+            "app.main.GatewayBypass.analyze",
+            new_callable=AsyncMock,
+            return_value={
+                "status": "inconclusive",
+                "reason": "No service was found in the test.",
+                "services": [],
+                "skipped_endpoints": [],
+            },
+        ) as gateway_bypass:
             response = self.client.get(
                 "/scan",
                 params={
@@ -1300,6 +1310,21 @@ class ScanPipelineTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "complete")
         self.assertEqual(events[-1]["payload"]["target"], FRONTEND)
         self.assertEqual(events[-1]["payload"]["summary"]["scan_mode"], "full")
+        gateway_bypass.assert_awaited_once()
+        self.assertEqual(gateway_bypass.await_args.args[0], FRONTEND)
+        gateway_bypass_kwargs = gateway_bypass.await_args.kwargs
+        self.assertEqual(
+            {
+                key: gateway_bypass_kwargs[key]
+                for key in ("scan_mode", "port_start", "port_end")
+            },
+            {
+                "scan_mode": "full",
+                "port_start": None,
+                "port_end": None,
+            },
+        )
+        self.assertTrue(callable(gateway_bypass_kwargs["progress_callback"]))
 
     @patch.dict(os.environ, {}, clear=True)
     def test_target_origin_is_used_without_gateway_configuration(self):
