@@ -484,6 +484,30 @@ function EndpointAssessments({ assessments, findings = [] }) {
       <Typography color="text.secondary" variant="body2">
         Reason: {endpoint.reason}
       </Typography>
+      {endpoint.rate_limit_selection_mode && (
+        <Typography color="text.secondary" variant="caption" display="block">
+          Rate-limit selection:{' '}
+          {endpoint.rate_limit_selected ? 'selected' : 'not selected'} (
+          {endpoint.rate_limit_selection_mode}) · {endpoint.rate_limit_selection_reason}
+        </Typography>
+      )}
+      {endpoint.rate_limit_assessment && (
+        <Box sx={{ mt: 1, p: 1, border: '1px solid #334155', borderRadius: 1 }}>
+          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+            Rate-limit test: {endpoint.rate_limit_assessment.status}
+          </Typography>
+          <Typography color="text.secondary" variant="body2">
+            {endpoint.rate_limit_assessment.reason}
+          </Typography>
+          <Typography color="text.secondary" variant="caption" display="block">
+            Requests: {endpoint.rate_limit_assessment.request_count} · HTTP statuses:{' '}
+            {(endpoint.rate_limit_assessment.status_codes ?? []).join(', ') || 'none'}
+            {endpoint.rate_limit_assessment.retry_after?.length
+              ? ` · Retry-After: ${endpoint.rate_limit_assessment.retry_after.join(', ')}`
+              : ''}
+          </Typography>
+        </Box>
+      )}
       {endpoint.test_cases.length === 0 ? (
         <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
           No test cases recorded.
@@ -566,6 +590,72 @@ function EndpointAssessments({ assessments, findings = [] }) {
       )}
     </Box>
   ))
+}
+
+function RateLimitResults({ assessments, summary }) {
+  const items = Array.isArray(assessments) ? assessments : []
+
+  return (
+    <Box sx={{ mt: 3 }}>
+      <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+        Rate Limit Testing
+      </Typography>
+      <Typography color="text.secondary" variant="body2" sx={{ mt: 0.5 }}>
+        {summary?.rate_limit_request_count ?? 0} of{' '}
+        {summary?.rate_limit_request_budget ?? 100} requests used (
+        {summary?.rate_limit_request_budget_remaining ?? 0} remaining).
+      </Typography>
+      {items.length === 0 ? (
+        <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
+          No eligible discovered GET endpoints were tested for rate limiting.
+        </Typography>
+      ) : (
+        <Table size="small" sx={{ mt: 1 }}>
+          <TableHead>
+            <TableRow>
+              <TableCell>Endpoint</TableCell>
+              <TableCell>Assessment</TableCell>
+              <TableCell>Requests / HTTP statuses</TableCell>
+              <TableCell>Rate-limit headers</TableCell>
+              <TableCell>Reason</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {items.map((item, index) => (
+              <TableRow key={`${item.method}-${item.path}-${index}`}>
+                <TableCell>{item.method ?? 'GET'} {item.path}</TableCell>
+                <TableCell>
+                  {item.assessment ?? item.status ?? 'inconclusive'}
+                  <Typography display="block" variant="caption" color="text.secondary">
+                    {item.authentication_context ?? 'unauthenticated'}
+                  </Typography>
+                </TableCell>
+                <TableCell>
+                  <Typography variant="body2">
+                    {item.request_count ?? 0} request(s)
+                  </Typography>
+                  <Typography display="block" variant="caption" color="text.secondary">
+                    HTTP status: {(item.status_codes ?? []).join(', ') || 'No response'}
+                  </Typography>
+                  {item.retry_after?.length > 0 && (
+                    <Typography display="block" variant="caption" color="text.secondary">
+                      Retry-After: {item.retry_after.join(', ')}
+                    </Typography>
+                  )}
+                </TableCell>
+                <TableCell>
+                  {Object.keys(item.rate_limit_headers ?? {}).length > 0
+                    ? JSON.stringify(item.rate_limit_headers)
+                    : 'None observed'}
+                </TableCell>
+                <TableCell>{item.reason ?? 'No reason reported.'}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+    </Box>
+  )
 }
 
 function BolaCorrelationResults({ assessments, baselines, activeTests, summary }) {
@@ -1282,8 +1372,8 @@ function ExecutiveSummary({ summary }) {
 function App() {
   const [target, setTarget] = useState('')
   const [scanMode, setScanMode] = useState('standard')
-  const [gatewayBypassPortStart, setGatewayBypassPortStart] = useState('')
-  const [gatewayBypassPortEnd, setGatewayBypassPortEnd] = useState('')
+  const [gatewayBypassPortStart, setGatewayBypassPortStart] = useState('8000')
+  const [gatewayBypassPortEnd, setGatewayBypassPortEnd] = useState('8100')
   const scanAbortController = useRef(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [scanResults, setScanResults] = useState([])
@@ -1294,6 +1384,7 @@ function App() {
   const [selectedUnscannedOrigin, setSelectedUnscannedOrigin] = useState('')
   const [findings, setFindings] = useState([])
   const [endpointAssessments, setEndpointAssessments] = useState([])
+  const [rateLimitAssessments, setRateLimitAssessments] = useState([])
   const [bolaAssessments, setBolaAssessments] = useState([])
   const [bolaBaselines, setBolaBaselines] = useState([])
   const [bolaActiveTests, setBolaActiveTests] = useState([])
@@ -1437,6 +1528,7 @@ function App() {
       setFindings(payload.findings ?? [])
       setSelectedFinding(null)
       setEndpointAssessments(payload.endpoint_assessments ?? [])
+      setRateLimitAssessments(payload.rate_limit_assessments ?? [])
       setBolaAssessments(payload.bola_assessments ?? [])
       setBolaBaselines(payload.bola_baselines ?? [])
       setBolaActiveTests(payload.bola_active_tests ?? [])
@@ -1458,6 +1550,7 @@ function App() {
         setFileDiscoveryError('')
         setFindings([])
         setEndpointAssessments([])
+        setRateLimitAssessments([])
         setBolaAssessments([])
         setBolaBaselines([])
         setBolaActiveTests([])
@@ -1505,6 +1598,7 @@ function App() {
         scanStages,
         discoveryResults: scanDiscoveryResults,
         endpointAssessments,
+        rateLimitAssessments,
         bolaAssessments,
         bolaBaselines,
         bolaActiveTests,
@@ -1751,21 +1845,6 @@ function App() {
                   <MenuItem value="full">Full Scan</MenuItem>
                 </Select>
               </FormControl>
-              <Typography
-                sx={{ flexBasis: '100%' }}
-                color="text.secondary"
-                variant="body2"
-              >
-                Standard Scan preserves the default selection and prioritization.
-                Full Scan may take longer and generate more requests; scope,
-                endpoint eligibility, and per-module safety limits still apply.
-              </Typography>
-
-              <Typography sx={{ flexBasis: '100%' }} color="text.secondary" variant="body2">
-                Gateway Bypass treats the input URL and all origins found in Discovery
-                as Gateway origins. Only loopback Gateway origins are actively checked.
-              </Typography>
-
               <Box
                 component="button"
                 disabled={loading}
@@ -1823,6 +1902,8 @@ function App() {
                   ['Actually tested endpoints', summary.tested_endpoints ?? 0],
                   ['Skipped or excluded endpoints', summary.skipped_endpoints ?? 0],
                   ['Test cases attempted', summary.test_cases_attempted ?? 0],
+                  ['Rate-limit endpoints tested', rateLimitAssessments.length],
+                  ['Rate-limit requests', summary.rate_limit_request_count ?? 0],
                   ['Test cases completed', summary.test_cases_completed ?? 0],
                   ['Test cases inconclusive', summary.inconclusive_tests ?? 0],
                   ['Test case errors', summary.error_tests ?? 0],
@@ -1891,6 +1972,7 @@ function App() {
                   Endpoint assessments and test cases
                 </Typography>
                 <EndpointAssessments assessments={endpointAssessments} />
+                <RateLimitResults assessments={rateLimitAssessments} summary={summary} />
                 <BolaCorrelationResults
                   assessments={bolaAssessments}
                   baselines={bolaBaselines}
@@ -2366,6 +2448,16 @@ function App() {
                       Endpoint test cases and evidence
                     </Box>
                     <EndpointAssessments assessments={endpointAssessments} findings={findings} />
+                  </Box>
+
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Rate-limit assessments ({rateLimitAssessments.length})
+                    </Box>
+                    <RateLimitResults
+                      assessments={rateLimitAssessments}
+                      summary={summary}
+                    />
                   </Box>
 
                   <Box component="details" sx={{ mt: 2 }}>

@@ -145,9 +145,16 @@ class AuthenticationTest:
     def __init__(self, endpoint_selector=None):
         self.endpoint_selector = endpoint_selector or EndpointSelector()
         self._login_cache = {}
+        self._authenticated_headers = {}
 
     def reset_scan_state(self):
         self._login_cache.clear()
+        self._authenticated_headers.clear()
+
+    def get_cached_authenticated_headers(self, target):
+        origin = Signin.normalize_target(target)
+        headers = self._authenticated_headers.get(origin)
+        return dict(headers) if headers else None
 
     def _signin_once(self, target, configuration):
         fingerprint = hashlib.sha256(
@@ -1600,6 +1607,17 @@ class AuthenticationTest:
                             discovery["authentication_result"] = "success"
                         else:
                             discovery["authentication_result"] = "inconclusive"
+                        evidence = authenticated_check["evidence"]
+                        if (
+                            evidence.get("status_code") not in {401, 403}
+                            and not evidence.get("authentication_denied")
+                            and not evidence.get("authorization_denial_detected")
+                            and not evidence.get("http_status_denial")
+                        ):
+                            origin = Signin.normalize_target(target)
+                            self._authenticated_headers[origin] = dict(
+                                authenticated_headers
+                            )
                     except httpx.TimeoutException:
                         authenticated_check = {
                             "status": "error",

@@ -13,6 +13,9 @@ test('exports all report sections and keeps the original report unchanged', () =
     summary: {
       scan_mode: 'full',
       scope: 'Authorized endpoints',
+      rate_limit_request_count: 11,
+      rate_limit_request_budget: 100,
+      rate_limit_request_budget_remaining: 89,
       overall_conclusion: { label: 'Cần xem xét' },
       coverage_limitations: [
         'Some discovered endpoints were not actually tested.',
@@ -33,6 +36,17 @@ test('exports all report sections and keeps the original report unchanged', () =
     endpointAssessments: [{
       path: '/api/items',
       test_cases: [{ status: 'skipped', reason: 'Ngoài phạm vi kiểm thử' }],
+    }],
+    rateLimitAssessments: [{
+      method: 'GET',
+      path: '/api/items',
+      assessment: 'Potential gap in tested burst',
+      status: 'potential',
+      request_count: 11,
+      status_codes: [200, 200, 429],
+      retry_after: ['5'],
+      rate_limit_headers: { 'x-ratelimit-limit': '10' },
+      reason: 'No limit observed in the tested window.',
     }],
     bolaBaselines: [{ baseline_status: 'captured' }],
     bolaAssessments: [{ assessment: 'potential', evidence_summary: 'Bằng chứng đầy đủ' }],
@@ -72,6 +86,10 @@ test('exports all report sections and keeps the original report unchanged', () =
   assert.match(html, /Cần xem xét/)
   assert.match(html, /Dữ liệu minh chứng/)
   assert.match(html, /Ngoài phạm vi kiểm thử/)
+  assert.match(html, /Rate Limit Testing/)
+  assert.match(html, /Potential gap in tested burst/)
+  assert.match(html, /x-ratelimit-limit/)
+  assert.match(html, /Requests used: 11/)
   assert.match(html, /Bằng chứng đầy đủ/)
   assert.match(html, /Active BOLA tests/)
   assert.match(html, /Gateway Bypass/)

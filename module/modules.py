@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from module.authentication_test import AuthenticationTest
 from module.bola_analysis import BolaAnalyzer
 from module.endpoint_selection import EndpointSelector
+from module.rate_limit_test import RateLimitTest
 from module.signin import LoginConfigurationError, Signin
 
 
@@ -14,6 +15,7 @@ _UNSELECTED = object()
 _READ_ONLY_METHODS = {"GET"}
 _MAX_AUTOMATIC_JWT_ENDPOINTS = 5
 _MAX_CONFIGURED_JWT_ENDPOINTS = 100
+_MAX_AUTOMATIC_RATE_LIMIT_ENDPOINTS = 5
 _DEFAULT_ACTIVE_BOLA_REQUEST_BUDGET = 10
 _DYNAMIC_PATH_SEGMENT = re.compile(
     r"(?:\$\{[^}]+\}|\{[^}]+\}|:[A-Za-z_][A-Za-z0-9_]*|\*)"
@@ -23,11 +25,17 @@ _DYNAMIC_PATH_SEGMENT = re.compile(
 class Modules:
     TEST_MODULE = EndpointSelector.TEST_MODULE
 
-    def __init__(self, endpoint_selector=None, authentication_test=None):
+    def __init__(
+        self,
+        endpoint_selector=None,
+        authentication_test=None,
+        rate_limit_test=None,
+    ):
         self.endpoint_selector = endpoint_selector or EndpointSelector()
         self.authentication_test = authentication_test or AuthenticationTest(
             self.endpoint_selector
         )
+        self.rate_limit_test = rate_limit_test or RateLimitTest()
 
     def classify_endpoint(self, endpoint):
         return self.endpoint_selector.classify_endpoint(endpoint)
@@ -419,6 +427,7 @@ class Modules:
         scan_mode="standard",
         progress_callback=None,
         cancellation_event=None,
+        rate_limit_testing=False,
     ):
         if scan_mode not in {"standard", "full"}:
             raise ValueError("scan_mode must be either 'standard' or 'full'.")
@@ -765,6 +774,163 @@ class Modules:
                 )
                 endpoint["test_results"].append(result)
                 report_progress()
+            discovered_rate_candidates = []
+            unsuitable_segments = (
+                self.endpoint_selector.UNSUITABLE_PATH_SEGMENTS
+                | self.endpoint_selector.SENSITIVE_PATH_SEGMENTS
+                | self.endpoint_selector.REGISTRATION_PATH_SEGMENTS
+                | self.endpoint_selector.NON_LOGIN_AUTH_PATH_SEGMENTS
+            )
+            supported_classifications = {
+                "authentication",
+                "resource_collection",
+                "resource_by_id",
+                "user_or_account",
+            }
+            for discovery_index, endpoint in enumerate(analyzed):
+                if endpoint.get("discovery_source") != "discovery":
+                    continue
+                identity = (
+                    str(endpoint.get("method") or "").upper(),
+                    endpoint.get("path"),
+                )
+                if identity[0] != "GET" or endpoint.get("jwt_path_error"):
+                    continue
+                path = identity[1]
+                if not isinstance(path, str):
+                    continue
+                segments = self.endpoint_selector._path_segments(path)
+                if not segments or any(
+                    segment in unsuitable_segments for segment in segments
+                ):
+                    continue
+                if _DYNAMIC_PATH_SEGMENT.search(path):
+                    continue
+                classification = self.endpoint_selector.classify_endpoint(endpoint)[
+                    "classification"
+                ]
+                if classification not in supported_classifications:
+                    continue
+                discovered_rate_candidates.append(
+                    (discovery_index, endpoint, identity, classification)
+                )
+
+            if rate_limit_testing:
+                rate_limit_selection = "user_opt_in"
+                if scan_mode == "full":
+                    selected_rate_candidates = discovered_rate_candidates
+                else:
+                    priority = {
+                        "authentication": 0,
+                        "user_or_account": 1,
+                        "resource_collection": 2,
+                        "resource_by_id": 3,
+                    }
+                    ordered_candidates = sorted(
+                        discovered_rate_candidates,
+                        key=lambda candidate: (
+                            priority[candidate[3]],
+                            candidate[0],
+                        ),
+                    )
+                    selected_groups = set()
+                    selected_rate_candidates = []
+                    for candidate in ordered_candidates:
+                        route_group = self._automatic_route_group(
+                            candidate[2][1]
+                        )
+                        group = (candidate[2][0], route_group)
+                        if group in selected_groups:
+                            continue
+                        selected_groups.add(group)
+                        selected_rate_candidates.append(candidate)
+                        if (
+                            len(selected_rate_candidates)
+                            >= _MAX_AUTOMATIC_RATE_LIMIT_ENDPOINTS
+                        ):
+                            break
+            else:
+                rate_limit_selection = "not_enabled"
+                selected_rate_candidates = []
+
+            selected_rate_identities = {
+                candidate[2] for candidate in selected_rate_candidates
+            }
+            selected_rate_endpoints = {
+                id(candidate[1]) for candidate in selected_rate_candidates
+            }
+            rate_limit_tested_count = 0
+            rate_limit_request_budget = RateLimitTest.SCAN_REQUEST_BUDGET
+            for endpoint in analyzed:
+                identity = (
+                    str(endpoint.get("method") or "").upper(),
+                    endpoint.get("path"),
+                )
+                is_discovered = endpoint.get("discovery_source") == "discovery"
+                is_selected = (
+                    identity in selected_rate_identities
+                    and id(endpoint) in selected_rate_endpoints
+                )
+                endpoint["rate_limit_selected"] = is_selected
+                endpoint["rate_limit_selection_mode"] = rate_limit_selection
+                endpoint["rate_limit_selection_reason"] = (
+                    "Selected from discovered GET authentication/resource endpoints."
+                    if is_selected
+                    else (
+                        "Rate-limit checks only use endpoints returned by Discovery."
+                        if not is_discovered
+                        else (
+                            "Rate-limit testing was not enabled for this scan."
+                            if rate_limit_selection == "not_enabled"
+                            else "Endpoint does not match the rate-limit selection criteria."
+                        )
+                    )
+                )
+                if (
+                    not is_selected
+                    or (cancellation_event and cancellation_event.is_set())
+                    or rate_limit_request_budget <= 0
+                ):
+                    if is_selected and rate_limit_request_budget <= 0:
+                        endpoint["rate_limit_selection_reason"] = (
+                            "Per-scan rate-limit request budget was exhausted before "
+                            "this endpoint could be tested."
+                        )
+                    continue
+                rate_limit_tested_count += 1
+                authenticated_headers = (
+                    self.authentication_test.get_cached_authenticated_headers(target)
+                )
+                result = self.rate_limit_test.analyze(
+                    target,
+                    endpoint,
+                    scan_mode=scan_mode,
+                    cancellation_event=cancellation_event,
+                    request_budget=rate_limit_request_budget,
+                    headers=authenticated_headers,
+                )
+                requests_sent = result.get("request_count", 0)
+                rate_limit_request_budget = max(
+                    rate_limit_request_budget - requests_sent,
+                    0,
+                )
+                endpoint["applicable_tests"] = list(
+                    dict.fromkeys(
+                        endpoint["applicable_tests"] + [RateLimitTest.TEST_MODULE]
+                    )
+                )
+                endpoint["test_results"].append(result)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "stage": "Rate Limit Testing",
+                            "status": "running",
+                            "detail": (
+                                f"Tested {rate_limit_tested_count} of "
+                                f"{len(selected_rate_endpoints)} selected endpoint(s)."
+                            ),
+                        }
+                    )
             bola_data = BolaAnalyzer(self.endpoint_selector).analyze(analyzed)
             endpoints_by_identity = {
                 (endpoint.get("method"), endpoint.get("path")): endpoint

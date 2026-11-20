@@ -121,6 +121,40 @@ class ScanPipelineTests(unittest.TestCase):
         self.assertEqual(file_scan.await_args.kwargs["gateway_target"], "")
         self.assertEqual(response.json()["target"], target)
 
+    def test_rate_limit_opt_in_flows_to_discovery_selected_testing_on_remote_target(self):
+        target = "https://api.example.test"
+        with patch(
+            "app.main.Discovery.discover",
+            return_value=[{"method": "GET", "path": "/api/users"}],
+        ), patch(
+            "app.main.FileDiscovery.scan",
+            new_callable=AsyncMock,
+            side_effect=ValueError("File Discovery is limited to loopback targets."),
+        ), patch(
+            "app.main.Modules.analyze_endpoints",
+            return_value=[],
+        ) as security_modules, patch(
+            "app.main.GatewayBypass.analyze",
+            new_callable=AsyncMock,
+            return_value={
+                "status": "inconclusive",
+                "services": [],
+                "reason": "Gateway bypass only analyzes loopback services.",
+            },
+        ):
+            response = self.client.get(
+                "/scan",
+                params={
+                    "target": target,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            security_modules.call_args.kwargs["rate_limit_testing"],
+            True,
+        )
+
     def test_invalid_target_returns_a_clear_error_without_scanning(self):
         with patch("app.main.Discovery.discover") as kiterunner:
             response = self.client.get(

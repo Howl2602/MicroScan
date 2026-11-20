@@ -148,6 +148,7 @@ export function createReportHtml(report) {
     <section><h2>Discovery stages and diagnostics</h2>${renderRecords(safe.scanStages, 'No scan stages were reported.')}${safe.fileDiscoveryError ? `<p><strong>File Discovery error:</strong> ${escapeHtml(safe.fileDiscoveryError)}</p>` : ''}</section>
     <section><h2>Discovery inventory and evidence</h2>${renderRecords(safe.discoveryResults, 'No discovery records were reported.')}</section>
     <section><h2>Endpoint test cases and evidence</h2>${renderRecords(safe.endpointAssessments, 'No endpoint assessments were reported.')}</section>
+    <section><h2>Rate Limit Testing</h2><p>Requests used: ${escapeHtml(safe.summary?.rate_limit_request_count ?? 0)}; remaining scan budget: ${escapeHtml(safe.summary?.rate_limit_request_budget_remaining ?? 0)} of ${escapeHtml(safe.summary?.rate_limit_request_budget ?? 100)}.</p>${renderRecords(safe.rateLimitAssessments, 'No eligible discovered GET endpoints were tested for rate limiting.')}</section>
     <section><h2>Passive BOLA assessments and baselines</h2>${renderRecords(safe.bolaBaselines, 'No BOLA baselines were reported.')}${renderRecords(safe.bolaAssessments, 'No passive BOLA assessments were reported.')}</section>
     <section><h2>Active BOLA tests</h2>${renderRecords(safe.bolaActiveTests, 'No active BOLA tests were reported.')}</section>
     ${renderGatewayBypass(safe.gatewayBypass)}

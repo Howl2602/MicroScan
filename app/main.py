@@ -1602,6 +1602,7 @@ async def _run_scan_pipeline(
     cancel_event=None,
     gateway_bypass_port_start=None,
     gateway_bypass_port_end=None,
+    rate_limit_testing=True,
 ):
     if scan_mode not in {"standard", "full"}:
         raise ValueError("scan_mode must be either 'standard' or 'full'.")
@@ -2412,6 +2413,7 @@ async def _run_scan_pipeline(
             "bola_assessments": report["bola_assessments"],
             "bola_baselines": report["bola_baselines"],
             "bola_active_tests": report["bola_active_tests"],
+            "rate_limit_assessments": report["rate_limit_assessments"],
             "gateway_bypass": report["gateway_bypass"],
             "discovery_results": discovery_results,
             "discovery_stages": list(stages.values()),
@@ -2460,6 +2462,7 @@ async def _run_scan_pipeline(
             if progress_callback
             else None,
             cancellation_event=cancel_event,
+            rate_limit_testing=rate_limit_testing,
         )
         if security_progress_futures:
             await asyncio.gather(
@@ -2496,6 +2499,7 @@ async def _run_scan_pipeline(
             "bola_assessments": report["bola_assessments"],
             "bola_baselines": report["bola_baselines"],
             "bola_active_tests": report["bola_active_tests"],
+            "rate_limit_assessments": report["rate_limit_assessments"],
             "gateway_bypass": report["gateway_bypass"],
             "discovery_results": discovery_results,
             "discovery_stages": list(stages.values()),
@@ -2867,6 +2871,7 @@ async def _run_scan_pipeline(
         "bola_assessments": report["bola_assessments"],
         "bola_baselines": report["bola_baselines"],
         "bola_active_tests": report["bola_active_tests"],
+        "rate_limit_assessments": report["rate_limit_assessments"],
         "gateway_bypass": report["gateway_bypass"],
         "discovery_results": discovery_results,
         "discovery_summary": file_result.get("summary", {}),
@@ -2948,6 +2953,7 @@ async def scan(
     scope_origins: list[str] = Query(default=[]),
     gateway_bypass_port_start: int | None = None,
     gateway_bypass_port_end: int | None = None,
+    rate_limit_testing: bool = True,
 ):
     if not stream:
         try:
@@ -2959,6 +2965,7 @@ async def scan(
                 scan_mode=scan_mode,
                 gateway_bypass_port_start=gateway_bypass_port_start,
                 gateway_bypass_port_end=gateway_bypass_port_end,
+                rate_limit_testing=rate_limit_testing,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2983,6 +2990,7 @@ async def scan(
                     cancel_event,
                     gateway_bypass_port_start,
                     gateway_bypass_port_end,
+                    rate_limit_testing,
                 )
                 await queue.put(
                     {"type": "complete", "status_code": status, "payload": payload}

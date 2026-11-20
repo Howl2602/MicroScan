@@ -3285,6 +3285,7 @@ class ScanContractTests(unittest.TestCase):
                     "target": "127.0.0.1:8085",
                     "num": 10,
                     "auto_jwt_local_lab": "true",
+                    "rate_limit_testing": "false",
                 },
             )
 
