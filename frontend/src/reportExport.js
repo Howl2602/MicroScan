@@ -68,7 +68,9 @@ function renderRecords(records, emptyMessage) {
 }
 
 function renderSummary(summary) {
-  const entries = Object.entries(summary ?? {})
+  const entries = Object.entries(summary ?? {}).filter(
+    ([key]) => key !== 'coverage_limitations',
+  )
   if (entries.length === 0) return '<p>No summary data was reported.</p>'
   return `<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>${entries
     .map(

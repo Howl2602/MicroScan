@@ -3,6 +3,7 @@ import {
   buildApiTree,
   filterDiscoveryResults,
   getApiMapPath,
+  getUnscannedOrigins,
 } from './apiMap.js'
 import { downloadReport } from './reportExport.js'
 import IntroductionPage from './IntroductionPage.jsx'
@@ -1020,7 +1021,7 @@ function FindingGroups({ findings, onSelect }) {
   if (findings.length === 0) {
     return (
       <Alert severity="info" sx={{ mt: 2 }}>
-        No confirmed or potential findings were reported. Review coverage limitations before interpreting this as a clean scan.
+        No confirmed or potential findings were reported.
       </Alert>
     )
   }
@@ -1153,26 +1154,6 @@ function ReportOverview({ summary, target, findings, fileDiscoveryError }) {
           </Card>
         ))}
       </Box>
-      {incomplete && (
-        <Alert severity="warning" sx={{ mt: 2 }}>
-          <Typography variant="subtitle2">Coverage may be incomplete</Typography>
-          {limitations.length > 0 ? limitations.map((limitation) => (
-            <Typography key={limitation} variant="body2">{limitation}</Typography>
-          )) : endpointCoverageIncomplete ? (
-            <Typography variant="body2">
-              {tested} of {discovered} discovered endpoints were tested.
-            </Typography>
-          ) : (
-            <Typography variant="body2">
-              {summary.failure_reason || 'Some scan stages were incomplete or returned errors.'}
-            </Typography>
-          )}
-          {discoveryErrors.map((message, index) => (
-            <Typography key={`discovery-warning-${index}`} variant="body2">{message}</Typography>
-          ))}
-          {fileDiscoveryError && <Typography variant="body2">{fileDiscoveryError}</Typography>}
-        </Alert>
-      )}
     </Box>
   )
 }
@@ -1251,16 +1232,6 @@ function ExecutiveSummary({ summary }) {
       <Typography color="text.secondary" variant="body2">
         {summary.test_case_count_note ?? 'Skipped and not-implemented cases are separate counts.'}
       </Typography>
-      {summary.coverage_limitations?.length > 0 && (
-        <Box sx={{ mt: 1 }}>
-          <Typography variant="subtitle2">Coverage limitations</Typography>
-          {summary.coverage_limitations.map((limitation) => (
-            <Typography key={limitation} color="text.secondary" variant="body2">
-              • {limitation}
-            </Typography>
-          ))}
-        </Box>
-      )}
       {summary.jwt_authentication_workflow && (
         <Box
           sx={{
@@ -1319,6 +1290,8 @@ function App() {
   const [scanResultsTarget, setScanResultsTarget] = useState('')
   const [scanDiscoveryResults, setScanDiscoveryResults] = useState([])
   const [scanStages, setScanStages] = useState([])
+  const [unscannedOrigins, setUnscannedOrigins] = useState([])
+  const [selectedUnscannedOrigin, setSelectedUnscannedOrigin] = useState('')
   const [findings, setFindings] = useState([])
   const [endpointAssessments, setEndpointAssessments] = useState([])
   const [bolaAssessments, setBolaAssessments] = useState([])
@@ -1363,14 +1336,16 @@ function App() {
     return { total, auth, resource }
   }, [scanResults])
 
-  const runScan = async () => {
-    const scanTarget = target.trim()
+  const runScan = async (targetOverride = null) => {
+    const scanTarget = targetOverride || target.trim()
+    const isFollowupScan = Boolean(targetOverride)
     if (!scanTarget) {
       setError('Enter a valid HTTP(S) target URL, for example http://localhost:5000.')
       return
     }
     if (
-      scanMode === 'standard'
+      !isFollowupScan
+      && scanMode === 'standard'
       && Boolean(gatewayBypassPortStart.trim()) !== Boolean(gatewayBypassPortEnd.trim())
     ) {
       setError('Enter both the start and end port, or leave both blank for the default range.')
@@ -1391,7 +1366,11 @@ function App() {
         scan_mode: scanMode,
         stream: 'true',
       })
-      if (gatewayBypassPortStart.trim() && gatewayBypassPortEnd.trim()) {
+      if (
+        !isFollowupScan
+        && gatewayBypassPortStart.trim()
+        && gatewayBypassPortEnd.trim()
+      ) {
         scanParams.set('gateway_bypass_port_start', gatewayBypassPortStart.trim())
         scanParams.set('gateway_bypass_port_end', gatewayBypassPortEnd.trim())
       }
@@ -1445,6 +1424,10 @@ function App() {
 
       const payload = completed.payload
       setScanStages(payload.discovery_stages ?? [])
+      setUnscannedOrigins(
+        getUnscannedOrigins(payload.discovery_stages ?? [], scanTarget),
+      )
+      setSelectedUnscannedOrigin('')
       setScanResults(payload.results ?? [])
       setScanResultsTarget(scanTarget)
       setScanDiscoveryResults(payload.discovery_results ?? [])
@@ -1497,6 +1480,8 @@ function App() {
               : stage
           )
         )
+        setUnscannedOrigins([])
+        setSelectedUnscannedOrigin('')
       } else {
         setError(caughtError.message || 'The scan could not be completed.')
       }
@@ -1784,7 +1769,7 @@ function App() {
               <Box
                 component="button"
                 disabled={loading}
-                onClick={runScan}
+                onClick={() => runScan()}
                 sx={{
                   px: 3,
                   py: 1.5,
@@ -1931,7 +1916,9 @@ function App() {
                 <Typography color="text.secondary" variant="body2" sx={{ mb: 2 }}>
                   The Scan target URL is used for discovery and endpoint verification without
                   changing its scheme, host, or port. File Discovery remains restricted to
-                  localhost, 127.0.0.1, and ::1. Redirects are not followed.
+                  localhost, 127.0.0.1, and ::1. Discovered URLs on the same hostname may be
+                  scanned across different schemes or ports; other hostnames are excluded.
+                  Redirects are not followed.
                 </Typography>
 
                 <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
@@ -2180,6 +2167,59 @@ function App() {
                 )}
               </CardContent>
             </Card>
+
+            {scanCount > 0 && unscannedOrigins.length > 0 && (
+              <Card sx={{ mt: 2 }}>
+                <CardContent>
+                  <Typography variant="h6" sx={{ mb: 1 }}>
+                    Other discovered origins ({unscannedOrigins.length})
+                  </Typography>
+                  <Alert severity="info" sx={{ mb: 2 }}>
+                    These origins were found in discovery evidence but were not scanned
+                    because their hostname differs from the target. Select one only if
+                    you are authorized to test it. Starting a follow-up scan replaces
+                    the currently displayed report; the target input remains unchanged.
+                  </Alert>
+                  <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <FormControl size="small" sx={{ minWidth: 280, flex: '1 1 280px' }}>
+                      <InputLabel id="followup-origin-label">Discovered origin</InputLabel>
+                      <Select
+                        labelId="followup-origin-label"
+                        value={selectedUnscannedOrigin}
+                        label="Discovered origin"
+                        onChange={(event) => setSelectedUnscannedOrigin(event.target.value)}
+                        disabled={loading}
+                      >
+                        <MenuItem value="">
+                          <em>Select an origin</em>
+                        </MenuItem>
+                        {unscannedOrigins.map((origin) => (
+                          <MenuItem key={origin} value={origin}>{origin}</MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <Box
+                      component="button"
+                      type="button"
+                      disabled={loading || !selectedUnscannedOrigin}
+                      onClick={() => runScan(selectedUnscannedOrigin)}
+                      sx={{
+                        px: 2,
+                        py: 1.25,
+                        border: 'none',
+                        borderRadius: 1,
+                        backgroundColor: loading || !selectedUnscannedOrigin ? '#475569' : 'primary.main',
+                        color: '#0B1120',
+                        fontWeight: 700,
+                        cursor: loading || !selectedUnscannedOrigin ? 'default' : 'pointer',
+                      }}
+                    >
+                      {loading ? 'SCANNING...' : 'SCAN SELECTED ORIGIN'}
+                    </Box>
+                  </Box>
+                </CardContent>
+              </Card>
+            )}
 
             {scanCount > 0 && (
               <>

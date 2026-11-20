@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from app.main import (
     RecursiveDiscoveryLimits,
     _authorized_discovered_origins,
-    _discovered_loopback_origins,
+    _discovered_same_host_origins,
     app,
 )
 from module.authentication_test import AuthenticationTest
@@ -100,6 +100,27 @@ class ScanPipelineTests(unittest.TestCase):
             self.assertEqual(file_scan.await_args.kwargs["gateway_target"], target)
             self.assertEqual(security_modules.call_args.args[0], target)
 
+    def test_followup_scan_can_run_for_a_discovered_non_loopback_origin(self):
+        target = "https://api.example.test"
+        with patch("app.main.Discovery.discover", return_value=[]) as discovery, patch(
+            "app.main.FileDiscovery.scan",
+            new_callable=AsyncMock,
+            side_effect=ValueError("File Discovery is limited to loopback targets."),
+        ) as file_scan, patch(
+            "app.main.Modules.analyze_endpoints", return_value=[]
+        ), patch(
+            "app.main.GatewayBypass.analyze",
+            new_callable=AsyncMock,
+            return_value={"status": "inconclusive", "services": [], "reason": "loopback only"},
+        ):
+            response = self.client.get("/scan", params={"target": target})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(discovery.call_args, call(target, 1000))
+        self.assertEqual(file_scan.await_args.args[0], target)
+        self.assertEqual(file_scan.await_args.kwargs["gateway_target"], "")
+        self.assertEqual(response.json()["target"], target)
+
     def test_invalid_target_returns_a_clear_error_without_scanning(self):
         with patch("app.main.Discovery.discover") as kiterunner:
             response = self.client.get(
@@ -116,7 +137,7 @@ class ScanPipelineTests(unittest.TestCase):
         self.assertIn("valid HTTP(S) origin", streamed_response.text)
         kiterunner.assert_not_called()
 
-    def test_loopback_api_evidence_is_added_without_manual_scope_input(self):
+    def test_same_host_api_evidence_is_added_without_manual_scope_input(self):
         file_result = {
             "results": [
                 {
@@ -141,7 +162,7 @@ class ScanPipelineTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
-            _discovered_loopback_origins(file_result, FRONTEND),
+            _discovered_same_host_origins(file_result, FRONTEND),
             {SECONDARY_ORIGIN},
         )
         self.assertEqual(discovery.call_args_list[1].args[0], SECONDARY_ORIGIN)
@@ -152,7 +173,7 @@ class ScanPipelineTests(unittest.TestCase):
             [FRONTEND, SECONDARY_ORIGIN],
         )
 
-    def test_loopback_api_evidence_does_not_expand_remote_target_scope(self):
+    def test_different_hostname_evidence_does_not_expand_target_scope(self):
         file_result = {
             "results": [
                 {
@@ -164,7 +185,7 @@ class ScanPipelineTests(unittest.TestCase):
             ]
         }
         self.assertEqual(
-            _discovered_loopback_origins(file_result, "https://example.test"),
+            _discovered_same_host_origins(file_result, "https://example.test"),
             set(),
         )
 
@@ -1622,8 +1643,9 @@ class ScanPipelineTests(unittest.TestCase):
         self.assertIn("https://outside.invalid", candidates["ignored_candidates"])
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_user_authorized_external_api_origin_can_be_scanned(self):
-        external = "https://api.example.test"
+    def test_discovered_same_host_origin_on_another_port_is_scanned(self):
+        target = "https://localhost:5000"
+        external = "http://localhost:8443"
         file_result = {
             "results": [
                 {
@@ -1656,11 +1678,11 @@ class ScanPipelineTests(unittest.TestCase):
         ):
             response = self.client.get(
                 "/scan",
-                params={"target": FRONTEND, "scope_origins": [external]},
+                params={"target": target},
             )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(initial_scan.call_args_list[0], call(FRONTEND, 1000))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(initial_scan.call_args_list[0], call(target, 1000))
         self.assertEqual(
             initial_scan.call_args_list[1],
             call(external, 1000, True, 45),
@@ -1668,8 +1690,21 @@ class ScanPipelineTests(unittest.TestCase):
         seeded_scan.assert_called_once_with(external, ["/api/orders"], 100)
         self.assertEqual(
             response.json()["summary"]["authorized_scope"],
-            [FRONTEND, external],
+            [target, external],
         )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_explicit_scope_with_different_hostname_is_rejected(self):
+        response = self.client.get(
+            "/scan",
+            params={
+                "target": FRONTEND,
+                "scope_origins": ["https://outside.invalid"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("same hostname", response.json()["detail"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_relative_paths_use_the_entered_target_without_profile_mapping(self):

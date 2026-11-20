@@ -14,6 +14,12 @@ test('exports all report sections and keeps the original report unchanged', () =
       scan_mode: 'full',
       scope: 'Authorized endpoints',
       overall_conclusion: { label: 'Cần xem xét' },
+      coverage_limitations: [
+        'Some discovered endpoints were not actually tested.',
+        'One or more test cases were skipped.',
+        'Some JWT test cases are not implemented.',
+        'Gateway Bypass did not complete with comparable service evidence.',
+      ],
     },
     findings: [{
       name: 'Authorization issue',
@@ -77,6 +83,7 @@ test('exports all report sections and keeps the original report unchanged', () =
   assert.match(html, /repeated_route_prefix/)
   assert.match(html, /status_changed/)
   assert.match(html, /Authorized endpoints/)
+  assert.doesNotMatch(html, /coverage_limitations|Some discovered endpoints were not actually tested|One or more test cases were skipped|Some JWT test cases are not implemented|Gateway Bypass did not complete with comparable service evidence/)
   assert.deepEqual(report, original)
 })
 

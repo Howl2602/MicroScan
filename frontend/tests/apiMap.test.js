@@ -10,6 +10,7 @@ import {
   filterDiscoveryResults,
   getApiMapPath,
   getDiscoveryCategory,
+  getUnscannedOrigins,
 } from '../src/apiMap.js'
 
 function flattenTree(node, values = []) {
@@ -149,6 +150,25 @@ test('API Map ignores malformed URLs and non-array results without throwing', ()
   assert.equal(getApiMapPath({ url: 'http://[invalid' }), null)
 })
 
+test('follow-up scan candidates include only discovered origins on other hostnames', () => {
+  assert.deepEqual(
+    getUnscannedOrigins(
+      [
+        {
+          stage: 'API Origin Candidates',
+          ignored_candidates: [
+            'https://api.example.test',
+            'https://api.example.test',
+            'http://localhost:8085',
+            'not a URL',
+          ],
+        },
+      ],
+      'http://localhost:5000',
+    ),
+    ['https://api.example.test'],
+  )
+})
 test('API Map retains unresolved dynamic URL templates as display paths', () => {
   const template = '/api/orders/${encodeURIComponent(id)}'
   assert.equal(getApiMapPath({ url: null, template }), template)

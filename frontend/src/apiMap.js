@@ -23,6 +23,43 @@ export function getApiMapPath(endpoint) {
   return null
 }
 
+export function getUnscannedOrigins(stages, scannedTarget) {
+  if (!Array.isArray(stages) || typeof scannedTarget !== 'string') return []
+
+  let scannedHostname
+  try {
+    const scannedUrl = new URL(scannedTarget.includes('://')
+      ? scannedTarget
+      : `http://${scannedTarget}`)
+    if (!['http:', 'https:'].includes(scannedUrl.protocol)) return []
+    scannedHostname = scannedUrl.hostname.toLowerCase()
+  } catch {
+    return []
+  }
+
+  const candidatesStage = stages.find((stage) => stage?.stage === 'API Origin Candidates')
+  const candidates = Array.isArray(candidatesStage?.ignored_candidates)
+    ? candidatesStage.ignored_candidates
+    : []
+
+  return [...new Set(candidates
+    .filter((candidate) => typeof candidate === 'string')
+    .map((candidate) => {
+      try {
+        const url = new URL(candidate)
+        if (!['http:', 'https:'].includes(url.protocol)) return null
+        return url.origin
+      } catch {
+        return null
+      }
+    })
+    .filter((origin) => {
+      if (!origin) return false
+      return new URL(origin).hostname.toLowerCase() !== scannedHostname
+    }))]
+    .sort()
+}
+
 export function getDiscoveryCategory(endpoint) {
   const status = Number(
     endpoint?.status_code ?? endpoint?.responses?.[0]?.sc ?? endpoint?.status,

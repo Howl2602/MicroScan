@@ -1,6 +1,5 @@
 import asyncio
 import ast
-import ipaddress
 import json
 import os
 import re
@@ -64,12 +63,9 @@ def _normalized_scope_origin(value):
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), "", "", ""))
 
 
-def _is_loopback_origin(value):
-    try:
-        hostname = (urlsplit(value).hostname or "").lower()
-        return hostname == "localhost" or ipaddress.ip_address(hostname).is_loopback
-    except ValueError:
-        return False
+def _normalized_scope_hostname(value):
+    normalized = validate_target(value)
+    return (urlsplit(normalized).hostname or "").lower()
 
 
 def _discovered_url_origins(file_result):
@@ -98,13 +94,12 @@ def _discovered_url_origins(file_result):
     return origins
 
 
-def _discovered_loopback_origins(file_result, target):
-    if not _is_loopback_origin(target):
-        return set()
+def _discovered_same_host_origins(file_result, target):
+    target_hostname = _normalized_scope_hostname(target)
     return {
         origin
         for origin in _discovered_url_origins(file_result)
-        if _is_loopback_origin(origin)
+        if _normalized_scope_hostname(origin) == target_hostname
     }
 
 
@@ -114,6 +109,13 @@ def _authorized_scan_scope(target, scope_origins):
         if not origin:
             continue
         normalized = _normalized_scope_origin(origin)
+        if _normalized_scope_hostname(normalized) != _normalized_scope_hostname(target):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Additional scan scope must use the same hostname as the target."
+                ),
+            )
         if normalized not in origins:
             origins.append(normalized)
     return origins
@@ -1618,7 +1620,11 @@ async def _run_scan_pipeline(
             await progress_callback(event)
 
     authorized_origins = _authorized_scan_scope(normalized_target, scope_origins)
-    file_verification_target = normalize_origin(normalized_target).rstrip("/")
+    file_verification_target = (
+        normalize_origin(normalized_target).rstrip("/")
+        if Signin.is_loopback_target(normalized_target)
+        else ""
+    )
     discovery_target = normalized_target
     limits = DISCOVERY_LIMITS
     logger.info(
@@ -1701,19 +1707,19 @@ async def _run_scan_pipeline(
                 "File Discovery could not retrieve an in-scope HTML document.",
             )
 
-    local_api_origins = sorted(
-        _discovered_loopback_origins(file_result, normalized_target)
+    same_host_origins = sorted(
+        _discovered_same_host_origins(file_result, normalized_target)
         - set(authorized_origins)
     )
-    authorized_origins.extend(local_api_origins)
-    if local_api_origins:
+    authorized_origins.extend(same_host_origins)
+    if same_host_origins:
         await emit(
             {
                 "stage": "Authorized Scope",
                 "status": "completed",
                 "detail": (
                     f"{', '.join(authorized_origins)} "
-                    "(loopback API origins found in target evidence)"
+                    "(same-host origins found in target evidence)"
                 ),
                 "origins": authorized_origins,
             }
@@ -1859,10 +1865,7 @@ async def _run_scan_pipeline(
             and "html" in (_endpoint_content_type(result) or "")
             for result in origin_results
         )
-        if (
-            has_html_discovery
-            and urlsplit(origin).hostname in {"localhost", "127.0.0.1", "::1"}
-        ):
+        if has_html_discovery:
             try:
                 await emit(
                     {
@@ -1879,6 +1882,11 @@ async def _run_scan_pipeline(
                     progress_callback=emit,
                 )
                 _merge_file_discovery_results(file_result, origin_files)
+                newly_authorized_origins = sorted(
+                    _discovered_same_host_origins(file_result, normalized_target)
+                    - set(authorized_origins)
+                )
+                authorized_origins.extend(newly_authorized_origins)
                 await emit(
                     {
                         "stage": f"File Analysis {origin}",
@@ -1889,6 +1897,18 @@ async def _run_scan_pipeline(
                         ),
                     }
                 )
+                if newly_authorized_origins:
+                    await emit(
+                        {
+                            "stage": "Authorized Scope",
+                            "status": "completed",
+                            "detail": (
+                                f"{', '.join(authorized_origins)} "
+                                "(same-host origins found in target evidence)"
+                            ),
+                            "origins": authorized_origins,
+                        }
+                    )
             except (ValueError, httpx.HTTPError, TimeoutError, RuntimeError) as exc:
                 logger.info(
                     "Authorized origin file analysis unavailable | target=%s | reason=%s",
