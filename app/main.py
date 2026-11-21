@@ -727,13 +727,11 @@ def _jwt_inventory_candidates(
     discovery_inventory,
     security_target,
     authorized_origins,
-    endpoint_allowlist=(),
 ):
     candidates = []
     exclusions = []
     target_origin = _normalized_scope_origin(security_target)
     authorized = set(authorized_origins)
-    allowlisted = set(endpoint_allowlist)
     seen = set()
 
     for record in discovery_inventory:
@@ -794,7 +792,6 @@ def _jwt_inventory_candidates(
                 reason = "Resolved endpoint URL is malformed or outside supported scope."
 
         path = _static_route_path(parsed.path or "/") if parsed else None
-        is_allowlisted = (method, path) in allowlisted
         if reason is None and (not path or path == "/"):
             reason = "Origin root is not an API route."
         if reason is None and (
@@ -825,7 +822,6 @@ def _jwt_inventory_candidates(
             )
         if (
             reason is None
-            and not is_allowlisted
             and record.get("verification_status") != "verified"
         ):
             if status_code not in {401, 403} and not (
@@ -2384,7 +2380,6 @@ async def _run_scan_pipeline(
         discovery_results,
         security_target,
         authorized_origins,
-        Modules._endpoint_allowlist(),
     )
     authentication_discovery_inventory = _jwt_discovery_inventory(
         discovery_results,
@@ -2620,13 +2615,6 @@ async def _run_scan_pipeline(
     )
     summary = report["summary"]
     discovered_count = summary["discovered_endpoints"]
-    allowlist_targets = sorted(
-        {
-            (endpoint.get("method"), endpoint.get("path"))
-            for endpoint in analyzed
-            if endpoint.get("jwt_allowlisted")
-        }
-    )
     zero_request_reason = None
     if not request_count:
         if not endpoints_for_testing:
@@ -2842,7 +2830,6 @@ async def _run_scan_pipeline(
                 and not endpoint.get("jwt_selected")
             ],
             "total_test_targets": len(analyzed),
-            "jwt_allowlist_configured": bool(allowlist_targets),
             "jwt_selection_mode": next(
                 (
                     endpoint.get("jwt_selection_mode")
@@ -2851,11 +2838,6 @@ async def _run_scan_pipeline(
                 ),
                 "not_confirmed",
             ),
-            "jwt_allowlist_entries": len(allowlist_targets),
-            "jwt_allowlist_targets": [
-                {"method": method, "path": path}
-                for method, path in allowlist_targets
-            ],
             "not_vulnerable": summary["not_detected_test_cases"],
             "auth_endpoints": sum(
                 1

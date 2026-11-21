@@ -30,6 +30,14 @@ test('exports all report sections and keeps the original report unchanged', () =
       severity: 'high',
       confidence: 'medium',
       evidence: { response_body: 'Dữ liệu minh chứng' },
+      remediation: {
+        root_cause: 'Authorization is missing.',
+        actions: ['Enforce object-level authorization.'],
+        retest_steps: ['Verify another user cannot access this object.'],
+        suggested_priority: 'high',
+        limitation: 'Confirm the intended policy.',
+        note: 'Offline, rule-based guidance.',
+      },
     }],
     scanStages: [{ stage: 'API Discovery', status: 'completed' }],
     discoveryResults: [{ url: '/api/items', verification_status: 'verified' }],
@@ -85,6 +93,9 @@ test('exports all report sections and keeps the original report unchanged', () =
   assert.match(html, /charset="utf-8"/)
   assert.match(html, /Cần xem xét/)
   assert.match(html, /Dữ liệu minh chứng/)
+  assert.match(html, /Offline remediation guidance/)
+  assert.match(html, /Enforce object-level authorization\./)
+  assert.match(html, /Verify another user cannot access this object\./)
   assert.match(html, /Ngoài phạm vi kiểm thử/)
   assert.match(html, /Rate Limit Testing/)
   assert.match(html, /Potential gap in tested burst/)

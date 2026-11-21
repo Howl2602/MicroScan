@@ -107,6 +107,24 @@ function renderGatewayBypass(report = {}) {
     return `<section><h2>Gateway Bypass</h2><p>Status: ${escapeHtml(report.status ?? 'not reported')}${report.reason ? ` — ${escapeHtml(report.reason)}` : ''}</p><p>Ports scanned: ${escapeHtml(report.ports_scanned ?? '—')}; open candidates: ${escapeHtml(report.open_ports_found ?? '—')}; endpoint comparisons: ${endpoints.length}.</p><h3>Gateway origins</h3>${renderRecords(report.gateway_origins, 'No Gateway origins were recorded from Discovery.')}<h3>Verified service origins</h3>${serviceRows}<h3>Gateway and direct-service comparisons</h3>${endpointRows}<h3>Excluded service-origin candidates</h3>${renderRecords(report.excluded_service_origins, 'No service-origin candidates were excluded.')}<h3>Skipped endpoints</h3>${renderRecords(report.skipped_endpoints, 'No discovered endpoints were skipped.')}</section>`
 }
 
+function renderRemediations(findings) {
+  const withGuidance = Array.isArray(findings)
+    ? findings.filter((finding) => finding?.remediation)
+    : []
+  if (withGuidance.length === 0) {
+    return '<p>No offline remediation guidance was reported.</p>'
+  }
+  return withGuidance.map((finding) => {
+    const remediation = finding.remediation
+    const renderList = (items) => (
+      Array.isArray(items) && items.length
+        ? `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+        : '<p>Not reported.</p>'
+    )
+    return `<article><h3>${escapeHtml(finding.name ?? 'Finding')} — ${escapeHtml(finding.method ?? '')} ${escapeHtml(finding.endpoint ?? '')}</h3><p><strong>Possible cause:</strong> ${escapeHtml(remediation.root_cause ?? 'Not reported.')}</p><p><strong>Suggested actions:</strong></p>${renderList(remediation.actions)}<p><strong>Retest checklist:</strong></p>${renderList(remediation.retest_steps)}<p><strong>Suggested priority:</strong> ${escapeHtml(remediation.suggested_priority ?? 'review')}</p><p><strong>Limitations:</strong> ${escapeHtml(remediation.limitation ?? 'Review recommendations against the application.')}</p><p>${escapeHtml(remediation.note ?? 'Offline, rule-based guidance; validate before applying.')}</p></article>`
+  }).join('')
+}
+
 export function createReportHtml(report) {
   const safe = sanitizeReportData(report)
   const target = safe.target || 'Not reported'
@@ -145,6 +163,7 @@ export function createReportHtml(report) {
   <main>
     <section><h2>Overview and scan profile</h2>${renderSummary(safe.summary)}</section>
     <section><h2>Findings, status, severity, confidence, and evidence</h2>${renderRecords(safe.findings, 'No findings were reported.')}</section>
+    <section><h2>Offline remediation guidance</h2>${renderRemediations(safe.findings)}</section>
     <section><h2>Discovery stages and diagnostics</h2>${renderRecords(safe.scanStages, 'No scan stages were reported.')}${safe.fileDiscoveryError ? `<p><strong>File Discovery error:</strong> ${escapeHtml(safe.fileDiscoveryError)}</p>` : ''}</section>
     <section><h2>Discovery inventory and evidence</h2>${renderRecords(safe.discoveryResults, 'No discovery records were reported.')}</section>
     <section><h2>Endpoint test cases and evidence</h2>${renderRecords(safe.endpointAssessments, 'No endpoint assessments were reported.')}</section>

@@ -1,5 +1,4 @@
 import ipaddress
-import json
 import os
 import re
 from urllib.parse import urlsplit
@@ -42,60 +41,15 @@ class Modules:
         return self.endpoint_selector.classify_endpoint(endpoint)
 
     def select_authentication_candidate(self, discovered_endpoints):
-        protected_path = os.environ.get("MICROSCAN_PROTECTED_ENDPOINT", "").strip()
         return self.endpoint_selector.select_authentication_candidate(
-            discovered_endpoints,
-            override_path=protected_path or None,
+            discovered_endpoints
         )
 
     @staticmethod
     def _endpoint_allowlist():
-        Signin.load_environment()
-        raw = os.environ.get("MICROSCAN_JWT_ENDPOINT_ALLOWLIST", "").strip()
-        allowlist = []
-        if raw:
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    "MICROSCAN_JWT_ENDPOINT_ALLOWLIST must be a JSON array."
-                ) from exc
-            if not isinstance(parsed, list):
-                raise ValueError(
-                    "MICROSCAN_JWT_ENDPOINT_ALLOWLIST must be a JSON array."
-                )
-            for item in parsed:
-                if not isinstance(item, dict):
-                    raise ValueError(
-                        "Each JWT endpoint allowlist entry must contain method and path."
-                    )
-                method = item.get("method")
-                path = item.get("path")
-                if not isinstance(method, str) or not isinstance(path, str):
-                    raise ValueError(
-                        "Each JWT endpoint allowlist entry must contain method and path."
-                    )
-                path_parts = urlsplit(path)
-                if (
-                    not re.fullmatch(r"[A-Za-z]+", method.strip())
-                    or any(character.isspace() for character in path)
-                    or not path.startswith("/")
-                    or path_parts.scheme
-                    or path_parts.netloc
-                    or path_parts.query
-                    or path_parts.fragment
-                ):
-                    raise ValueError(
-                        "JWT endpoint allowlist paths must be origin-relative paths "
-                        "without query or fragment data."
-                    )
-                allowlist.append((method.strip().upper(), path))
-
-        legacy_path = os.environ.get("MICROSCAN_PROTECTED_ENDPOINT", "").strip()
-        if legacy_path:
-            allowlist.append(("GET", legacy_path))
-
-        return list(dict.fromkeys(allowlist))
+        # Endpoint selection now comes exclusively from the scoped Discovery inventory.
+        # Keeping this compatibility method prevents callers from needing to change.
+        return []
 
     @staticmethod
     def _is_local_target(target):
@@ -432,28 +386,9 @@ class Modules:
         selected_candidate=_UNSELECTED,
     ):
         if selected_candidate is _UNSELECTED:
-            allowlist = self._endpoint_allowlist()
-            selected_candidate = None
-            for method, path in allowlist:
-                if method not in _READ_ONLY_METHODS:
-                    continue
-                endpoint = next(
-                    (
-                        item
-                        for item in discovered_endpoints or []
-                        if isinstance(item, dict)
-                        and str(item.get("method") or "").upper() == method
-                        and (item.get("path") or item.get("target")) == path
-                    ),
-                    None,
-                )
-                selected_candidate = {
-                    "endpoint": endpoint,
-                    "path": path,
-                    "method": method,
-                    "reason": "endpoint explicitly included in JWT endpoint allowlist",
-                }
-                break
+            selected_candidate = self.select_authentication_candidate(
+                discovered_endpoints or []
+            )
         return self.authentication_test.evaluate(
             target,
             selected_candidate,
@@ -510,8 +445,6 @@ class Modules:
             )
             analyzed.append(endpoint)
 
-        allowlist = self._endpoint_allowlist() if jwt_testing else []
-        allowlist_set = set(allowlist)
         authentication_inventory = (
             discovered_inventory
             if discovered_inventory is not None
@@ -543,25 +476,6 @@ class Modules:
             if active_bola_enabled
             else []
         )
-        for method, path in allowlist:
-            identity = (method, path)
-            if identity not in endpoints_by_identity:
-                analyzed.append(
-                    {
-                        "method": method,
-                        "path": path,
-                        "responses": [],
-                        "discovery_source": "configured_allowlist",
-                        "discovered": False,
-                        "classification": self.endpoint_selector.classify_endpoint(
-                            {"method": method, "path": path}
-                        )["classification"],
-                        "classification_reason": "endpoint explicitly configured in JWT allowlist",
-                        "applicable_tests": [],
-                        "test_results": [],
-                    }
-                )
-
         auto_mode_reason = None
         selected_reasons = {}
         eligible_identities = set()
@@ -576,21 +490,7 @@ class Modules:
             selection_mode = "not_selected"
             selection_budget["mode"] = selection_mode
             auto_mode_reason = "JWT authentication was not selected for this scan."
-        elif allowlist:
-            selection_mode = "explicit_allowlist"
-            selection_budget["mode"] = selection_mode
-            eligible_identities = {
-                identity
-                for identity in allowlist_set
-                if identity in endpoints_by_identity
-                and identity[0] in _READ_ONLY_METHODS
-                and not endpoints_by_identity[identity].get("jwt_path_error")
-            }
-            selected_reasons = {
-                identity: "Endpoint explicitly included in JWT endpoint allowlist."
-                for identity in eligible_identities
-            }
-        elif auto_jwt_local_lab and self._is_local_target(target):
+        elif jwt_testing:
             selection_mode = "automatic_local_lab"
             selection_budget["mode"] = selection_mode
             candidates_by_group = {}
@@ -674,19 +574,12 @@ class Modules:
                             f"{endpoint_budget} endpoint groups per scan; "
                             "higher-priority candidates were selected first."
                         )
-        elif auto_jwt_local_lab:
-            selection_mode = "blocked_non_local_target"
-            selection_budget["mode"] = selection_mode
-            auto_mode_reason = (
-                "Automatic JWT testing is restricted to host-local targets "
-                "(localhost, 127.0.0.0/8, or ::1)."
-            )
         else:
             selection_mode = "not_confirmed"
             selection_budget["mode"] = selection_mode
             auto_mode_reason = (
-                "Automatic JWT selection is disabled for this scan; configure an explicit "
-                "endpoint allowlist to test specific discovered endpoints."
+                "Automatic JWT selection is disabled for this scan; enable the JWT "
+                "authentication module to select eligible discovered GET endpoints."
             )
 
         rate_limit_candidates = self._rate_limit_candidates(analyzed)
@@ -773,8 +666,6 @@ class Modules:
                 if cancellation_event and cancellation_event.is_set():
                     break
                 identity = (endpoint.get("method") or "", endpoint.get("path"))
-                is_allowlisted = identity in allowlist_set
-                endpoint["jwt_allowlisted"] = is_allowlisted
                 endpoint["jwt_eligible"] = identity in eligible_identities
                 endpoint["jwt_selection_mode"] = selection_mode
                 endpoint["jwt_selection_budget"] = dict(selection_budget)
@@ -800,18 +691,6 @@ class Modules:
                         "JWT authentication was not selected for this scan."
                     )
                     continue
-                if endpoint.get("discovery_source") == "configured_allowlist":
-                    endpoint["jwt_selected"] = False
-                    endpoint["jwt_selection_reason"] = (
-                        "Allowlisted endpoint was not present in this scan's Discovery results."
-                    )
-                    endpoint["test_results"].append(
-                        self.authentication_test.skipped_result(
-                            endpoint, endpoint["jwt_selection_reason"]
-                        )
-                    )
-                    report_progress()
-                    continue
                 if endpoint.get("jwt_path_error"):
                     endpoint["jwt_selected"] = False
                     endpoint["jwt_selection_reason"] = endpoint["jwt_path_error"]
@@ -823,12 +702,7 @@ class Modules:
                     report_progress()
                     continue
                 if not reason:
-                    if allowlist:
-                        skip_reason = (
-                            "Endpoint was discovered but is not explicitly included in "
-                            "MICROSCAN_JWT_ENDPOINT_ALLOWLIST."
-                        )
-                    elif identity in automatic_skip_reasons:
+                    if identity in automatic_skip_reasons:
                         skip_reason = automatic_skip_reasons[identity]
                     elif (endpoint.get("method") or "") not in _READ_ONLY_METHODS:
                         skip_reason = (

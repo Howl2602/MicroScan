@@ -854,6 +854,38 @@ function VulnerabilityFindings({ findings }) {
       <Typography variant="body2" sx={{ mt: 1 }}>
         Recommendation: {finding.recommendation}
       </Typography>
+      {finding.remediation && (
+        <Box sx={{ mt: 2, p: 1.5, border: '1px solid #334155', borderRadius: 1 }}>
+          <Typography variant="subtitle2">Offline remediation guidance</Typography>
+          <Typography variant="body2" sx={{ mt: 0.75 }}>
+            Possible cause: {finding.remediation.root_cause}
+          </Typography>
+          <Typography variant="body2" sx={{ mt: 1, fontWeight: 700 }}>
+            Suggested actions
+          </Typography>
+          <Box component="ul" sx={{ mt: 0.5, mb: 0, pl: 3 }}>
+            {(finding.remediation.actions ?? []).map((action, actionIndex) => (
+              <li key={`${actionIndex}-${action}`}>
+                <Typography variant="body2">{action}</Typography>
+              </li>
+            ))}
+          </Box>
+          <Typography variant="body2" sx={{ mt: 1, fontWeight: 700 }}>
+            Retest checklist
+          </Typography>
+          <Box component="ul" sx={{ mt: 0.5, mb: 0, pl: 3 }}>
+            {(finding.remediation.retest_steps ?? []).map((step, stepIndex) => (
+              <li key={`${stepIndex}-${step}`}>
+                <Typography variant="body2">{step}</Typography>
+              </li>
+            ))}
+          </Box>
+          <Typography color="text.secondary" variant="caption" display="block" sx={{ mt: 1 }}>
+            Suggested priority: {finding.remediation.suggested_priority ?? 'review'}.{' '}
+            {finding.remediation.limitation} {finding.remediation.note}
+          </Typography>
+        </Box>
+      )}
       <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
         Source test case: {finding.test_case}
       </Typography>
@@ -1873,6 +1905,9 @@ function App() {
                 <Typography variant="subtitle1" sx={{ mb: 0.5 }}>
                   Security modules
                 </Typography>
+                <Typography color="text.secondary" variant="body2" sx={{ mb: 0.5 }}>
+                  Only enable active modules for targets you are authorized to test. Candidate endpoints are selected from Discovery classifications and remain inside the scan scope.
+                </Typography>
                 <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
                   {[
                     ['jwt_authentication', 'JWT / Authentication'],
@@ -2476,20 +2511,11 @@ function App() {
 
                   <Box component="details" sx={{ mt: 2 }}>
                     <Box component="summary" sx={{ cursor: 'pointer' }}>
-                      JWT selection, budgets, and allowlist
+                      JWT discovery selection and budgets
                     </Box>
                     <Typography sx={{ mt: 1 }} variant="body2">
                       JWT selection mode: {summary.jwt_selection_mode ?? 'not_confirmed'}
                     </Typography>
-                    <Typography color="text.secondary" variant="body2">
-                      Explicit allowlist entries: {summary.jwt_allowlist_entries ?? 0}
-                      {summary.jwt_allowlist_configured ? ' (mandatory scope boundary)' : ''}
-                    </Typography>
-                    {summary.jwt_allowlist_targets?.map((endpoint) => (
-                      <Typography key={`${endpoint.method}-${endpoint.path}`} color="text.secondary" variant="body2">
-                        Allowlisted: {endpoint.method} {endpoint.path}
-                      </Typography>
-                    ))}
                     {summary.jwt_selection_budgets?.map((budget, index) => (
                       <Typography key={`jwt-budget-${index}`} color="text.secondary" variant="body2">
                         JWT selection budget ({budget.mode ?? 'unknown'}): {budget.used ?? '—'} of {budget.configured ?? 'not applicable'} group(s) used

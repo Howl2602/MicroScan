@@ -2806,6 +2806,23 @@ class PentestReportTests(unittest.TestCase):
         self.assertTrue(report["findings"][0]["recommendation"])
         self.assertEqual(report["findings"][0]["severity"], None)
 
+    def test_findings_include_offline_remediation_and_retest_guidance(self):
+        report = build_pentest_report(
+            [
+                self.endpoint_with_cases(
+                    self.case("potential", test_case="without_token")
+                )
+            ]
+        )
+
+        remediation = report["findings"][0]["remediation"]
+        self.assertIn("Offline, rule-based", remediation["note"])
+        self.assertTrue(
+            any("authorization" in action.lower() for action in remediation["actions"])
+        )
+        self.assertTrue(remediation["retest_steps"])
+        self.assertIn("not a severity assessment", remediation["note"])
+
     def test_report_downgrades_confirmed_cases_with_conflict_or_incomplete_evidence(self):
         for evidence_update in (
             {"body_denial_signal": True},

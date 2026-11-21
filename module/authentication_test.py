@@ -1560,7 +1560,7 @@ class AuthenticationTest:
         if method != "GET":
             return self.skipped_result(
                 {"method": method, "path": protected_path},
-                "Only explicitly allowlisted GET endpoints are currently probed.",
+                "Only discovered GET endpoints are eligible for JWT probes.",
             )
         try:
             url = self._scope_url(target, protected_path)
