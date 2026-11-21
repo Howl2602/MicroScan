@@ -812,109 +812,6 @@ function BolaCorrelationResults({ assessments, baselines, activeTests, summary }
   )
 }
 
-function VulnerabilityFindings({ findings }) {
-  if (findings.length === 0) {
-    return (
-      <Typography color="text.secondary" sx={{ mt: 1 }}>
-        No confirmed or potential vulnerabilities were identified from the collected evidence.
-      </Typography>
-    )
-  }
-
-  return findings.map((finding, index) => (
-    <Box
-      key={finding.finding_id ?? `${finding.method}-${finding.endpoint}-${finding.test_case}-${index}`}
-      sx={{ mt: 2, p: 2, border: '1px solid #334155', borderRadius: 1 }}
-    >
-      <Chip
-        label={finding.status === 'confirmed' ? 'Confirmed' : 'Potential'}
-        size="small"
-        color={finding.status === 'confirmed' ? 'error' : 'warning'}
-        sx={{ mr: 1 }}
-      />
-      <Typography component="span" variant="subtitle1">
-        {finding.name}
-      </Typography>
-      <Typography color="text.secondary" variant="body2" sx={{ mt: 0.5 }}>
-        {finding.method} {finding.endpoint} · Severity: {finding.severity ?? 'Not assessed'}
-      </Typography>
-      <Typography variant="body2" sx={{ mt: 1 }}>
-        {finding.reason}
-      </Typography>
-      {finding.request_condition && (
-        <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
-          Request condition: {finding.request_condition}
-        </Typography>
-      )}
-      {finding.unverified && (
-        <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
-          Not verified: {finding.unverified}
-        </Typography>
-      )}
-      <Typography variant="body2" sx={{ mt: 1 }}>
-        Recommendation: {finding.recommendation}
-      </Typography>
-      {finding.remediation && (
-        <Box sx={{ mt: 2, p: 1.5, border: '1px solid #334155', borderRadius: 1 }}>
-          <Typography variant="subtitle2">Offline remediation guidance</Typography>
-          <Typography variant="body2" sx={{ mt: 0.75 }}>
-            Possible cause: {finding.remediation.root_cause}
-          </Typography>
-          <Typography variant="body2" sx={{ mt: 1, fontWeight: 700 }}>
-            Suggested actions
-          </Typography>
-          <Box component="ul" sx={{ mt: 0.5, mb: 0, pl: 3 }}>
-            {(finding.remediation.actions ?? []).map((action, actionIndex) => (
-              <li key={`${actionIndex}-${action}`}>
-                <Typography variant="body2">{action}</Typography>
-              </li>
-            ))}
-          </Box>
-          <Typography variant="body2" sx={{ mt: 1, fontWeight: 700 }}>
-            Retest checklist
-          </Typography>
-          <Box component="ul" sx={{ mt: 0.5, mb: 0, pl: 3 }}>
-            {(finding.remediation.retest_steps ?? []).map((step, stepIndex) => (
-              <li key={`${stepIndex}-${step}`}>
-                <Typography variant="body2">{step}</Typography>
-              </li>
-            ))}
-          </Box>
-          <Typography color="text.secondary" variant="caption" display="block" sx={{ mt: 1 }}>
-            Suggested priority: {finding.remediation.suggested_priority ?? 'review'}.{' '}
-            {finding.remediation.limitation} {finding.remediation.note}
-          </Typography>
-        </Box>
-      )}
-      <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
-        Source test case: {finding.test_case}
-      </Typography>
-      {finding.evidence && (
-        <Box component="details" sx={{ mt: 1 }}>
-          <Box component="summary" sx={{ cursor: 'pointer' }}>
-            View finding evidence
-          </Box>
-          <Box
-            component="pre"
-            sx={{
-              mt: 1,
-              p: 1.5,
-              borderRadius: 1,
-              backgroundColor: '#0B1120',
-              color: '#CBD5E1',
-              whiteSpace: 'pre-wrap',
-              overflowWrap: 'anywhere',
-              fontSize: '0.8rem',
-            }}
-          >
-            {JSON.stringify(finding.evidence, null, 2)}
-          </Box>
-        </Box>
-      )}
-    </Box>
-  ))
-}
-
 function GatewayBypassResults({ report }) {
   const services = Array.isArray(report?.services) ? report.services : []
 
@@ -1108,9 +1005,40 @@ function FindingDetail({ findings, endpointAssessments, target, onClose }) {
         )}
         <Typography variant="subtitle2" sx={{ mt: 2 }}>Recommended remediation</Typography>
         {findings.map((item, index) => (
-          <Typography key={`${item.test_case}-recommendation-${index}`} variant="body2">
-            {item.recommendation || 'Review and enforce the intended authorization policy.'}
-          </Typography>
+          <Box key={`${item.test_case}-recommendation-${index}`} sx={{ mb: 1.5 }}>
+            <Typography variant="body2">
+              {item.recommendation || 'Review and enforce the intended authorization policy.'}
+            </Typography>
+            {item.remediation && (
+              <Box sx={{ mt: 1, p: 1.5, border: '1px solid #334155', borderRadius: 1 }}>
+                <Typography variant="subtitle2">Suggested fix</Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                  {item.remediation.root_cause}
+                </Typography>
+                <Box component="ul" sx={{ mt: 0.75, mb: 0, pl: 3 }}>
+                  {(item.remediation.actions ?? []).map((action, actionIndex) => (
+                    <li key={`${actionIndex}-${action}`}>
+                      <Typography variant="body2">{action}</Typography>
+                    </li>
+                  ))}
+                </Box>
+                <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                  Retest
+                </Typography>
+                <Box component="ul" sx={{ mt: 0.5, mb: 0, pl: 3 }}>
+                  {(item.remediation.retest_steps ?? []).map((step, stepIndex) => (
+                    <li key={`${stepIndex}-${step}`}>
+                      <Typography variant="body2">{step}</Typography>
+                    </li>
+                  ))}
+                </Box>
+                <Typography color="text.secondary" variant="caption" display="block" sx={{ mt: 1 }}>
+                  Suggested priority: {item.remediation.suggested_priority ?? 'review'}.{' '}
+                  {item.remediation.limitation} {item.remediation.note}
+                </Typography>
+              </Box>
+            )}
+          </Box>
         ))}
         {target && (
           <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 2 }}>
@@ -1714,6 +1642,7 @@ function App() {
   const totalPotentialFindings =
     summary.potential_findings ??
     findings.filter((item) => item.status === 'potential').length
+  const selectedModuleCount = Object.values(selectedModules).filter(Boolean).length
   const apiMapResults = (Array.isArray(scanDiscoveryResults) ? scanDiscoveryResults : [])
     .filter((item) => getApiMapPath(item))
   const notFoundDiscoveryResults = filterDiscoveryResults(scanDiscoveryResults, 'not_found')
@@ -1871,7 +1800,7 @@ function App() {
             <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
               <Box
                 component="input"
-                placeholder="http://localhost:5000"
+                placeholder="https://api.example.com"
                 value={target}
                 onChange={(event) => setTarget(event.target.value)}
                 sx={{
@@ -1887,56 +1816,66 @@ function App() {
                 }}
               />
 
-              <FormControl sx={{ minWidth: 180 }}>
-                <InputLabel id="scan-mode-label">Scan mode</InputLabel>
-                <Select
-                  labelId="scan-mode-label"
-                  id="scan-mode"
-                  value={scanMode}
-                  label="Scan mode"
-                  onChange={(event) => setScanMode(event.target.value)}
-                  disabled={loading}
-                >
-                  <MenuItem value="standard">Standard Scan</MenuItem>
-                  <MenuItem value="full">Full Scan</MenuItem>
-                </Select>
-              </FormControl>
-              <Box sx={{ flex: '1 1 100%', mt: 1 }}>
-                <Typography variant="subtitle1" sx={{ mb: 0.5 }}>
-                  Security modules
-                </Typography>
-                <Typography color="text.secondary" variant="body2" sx={{ mb: 0.5 }}>
-                  Only enable active modules for targets you are authorized to test. Candidate endpoints are selected from Discovery classifications and remain inside the scan scope.
-                </Typography>
-                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
-                  {[
-                    ['jwt_authentication', 'JWT / Authentication'],
-                    ['bola', 'BOLA'],
-                    ['rate_limit', 'Rate Limit'],
-                    ['gateway_bypass', 'Gateway Bypass'],
-                  ].map(([module, label]) => (
-                    <FormControlLabel
-                      key={module}
-                      disabled={loading}
-                      control={(
-                        <Checkbox
-                          checked={selectedModules[module]}
-                          onChange={(event) => {
-                            const checked = event.target.checked
-                            setSelectedModules((current) => ({
-                              ...current,
-                              [module]: checked,
-                            }))
-                          }}
-                        />
-                      )}
-                      label={label}
-                    />
-                  ))}
+              <Box component="details" sx={{ flex: '1 1 100%', mt: 1 }}>
+                <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 600 }}>
+                  Scan options — {scanMode === 'full' ? 'Full scan' : 'Standard scan'} ·{' '}
+                  {selectedModuleCount > 0
+                    ? `${selectedModuleCount} security checks`
+                    : 'Discovery only'}
                 </Box>
-                <Typography color="text.secondary" variant="caption">
-                  Discovery always runs. Login/session setup is shared by the selected modules when needed.
-                </Typography>
+                <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap', mt: 1 }}>
+                  <FormControl sx={{ minWidth: 180 }}>
+                    <InputLabel id="scan-mode-label">Scan mode</InputLabel>
+                    <Select
+                      labelId="scan-mode-label"
+                      id="scan-mode"
+                      value={scanMode}
+                      label="Scan mode"
+                      onChange={(event) => setScanMode(event.target.value)}
+                      disabled={loading}
+                    >
+                      <MenuItem value="standard">Standard Scan</MenuItem>
+                      <MenuItem value="full">Full Scan</MenuItem>
+                    </Select>
+                  </FormControl>
+                  <Box sx={{ flex: '1 1 100%' }}>
+                    <Typography variant="subtitle1" sx={{ mb: 0.5 }}>
+                      Security checks
+                    </Typography>
+                    <Typography color="text.secondary" variant="body2" sx={{ mb: 0.5 }}>
+                      Choose optional checks for targets in your approved assessment scope.
+                    </Typography>
+                    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                      {[
+                        ['jwt_authentication', 'JWT / Authentication'],
+                        ['bola', 'BOLA'],
+                        ['rate_limit', 'Rate Limit'],
+                        ['gateway_bypass', 'Gateway Bypass'],
+                      ].map(([module, label]) => (
+                        <FormControlLabel
+                          key={module}
+                          disabled={loading}
+                          control={(
+                            <Checkbox
+                              checked={selectedModules[module]}
+                              onChange={(event) => {
+                                const checked = event.target.checked
+                                setSelectedModules((current) => ({
+                                  ...current,
+                                  [module]: checked,
+                                }))
+                              }}
+                            />
+                          )}
+                          label={label}
+                        />
+                      ))}
+                    </Box>
+                    <Typography color="text.secondary" variant="caption">
+                      Endpoint discovery always runs. Login/session setup is shared when needed.
+                    </Typography>
+                  </Box>
+                </Box>
               </Box>
               <Box
                 component="button"
@@ -1979,10 +1918,49 @@ function App() {
               )}
             </Box>
             <DiscoveryProgress stages={scanStages} loading={loading} />
-            <Box sx={{ mt: 4 }}>
-              <Typography variant="h6" sx={{ mb: 2 }}>
-                Discovery Summary
-              </Typography>
+            {scanCount > 0 && (
+              <>
+              <Card sx={{ mt: 3 }}>
+                <CardContent>
+                  <ReportOverview
+                    summary={summary}
+                    target={scanResultsTarget || target}
+                    findings={findings}
+                    fileDiscoveryError={fileDiscoveryError}
+                  />
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
+                      Findings ({findings.length}) — select a finding for details
+                    </Box>
+                    <FindingGroups
+                      findings={findings}
+                      onSelect={(finding) => setSelectedFinding(finding)}
+                    />
+                    {selectedFinding && (
+                      <FindingDetail
+                        findings={findings.filter(
+                          (finding) =>
+                            finding.method === selectedFinding.method &&
+                            finding.endpoint === selectedFinding.endpoint &&
+                            finding.name === selectedFinding.name,
+                        )}
+                        endpointAssessments={endpointAssessments}
+                        target={scanResultsTarget || target}
+                        onClose={() => setSelectedFinding(null)}
+                      />
+                    )}
+                  </Box>
+                </CardContent>
+              </Card>
+
+            <Box component="details" sx={{ mt: 3 }}>
+              <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
+                Scan coverage metrics
+              </Box>
+              <Box sx={{ mt: 2 }}>
+                <Typography variant="h6" sx={{ mb: 2 }}>
+                  Detailed coverage
+                </Typography>
               <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 1, mb: 3 }}>
                 {[
                   ['Scan mode', summary.scan_mode === 'full' ? 'Full Scan' : 'Standard Scan'],
@@ -2019,11 +1997,16 @@ function App() {
                   </Box>
                 ))}
               </Box>
+              </Box>
             </Box>
 
-            <Typography variant="h6" sx={{ mb: 1 }}>
-              Discovered Endpoints ({visibleScanDiscoveryResults.length})
-            </Typography>
+            <Box component="details" sx={{ mt: 2 }}>
+              <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
+                Discovered endpoints ({visibleScanDiscoveryResults.length})
+              </Box>
+              <Typography color="text.secondary" variant="body2" sx={{ mt: 1, mb: 2 }}>
+                Search and filter the API inventory found during this scan.
+              </Typography>
             <Box
               component="input"
               aria-label="Search discovered endpoints"
@@ -2060,36 +2043,61 @@ function App() {
               </Typography>
               <DiscoveryResultsTable results={notFoundDiscoveryResults} />
             </Box>
+            </Box>
 
-            <Card sx={{ mt: 4 }}>
-              <CardContent>
-                <Typography variant="h6">Pentest Analysis</Typography>
-                <ExecutiveSummary summary={summary} />
-                <Typography variant="subtitle1" sx={{ mt: 3, fontWeight: 700 }}>
-                  Vulnerability findings
-                </Typography>
-                <VulnerabilityFindings findings={findings} />
-                <Typography variant="subtitle1" sx={{ mt: 3, fontWeight: 700 }}>
-                  Endpoint assessments and test cases
-                </Typography>
-                <EndpointAssessments assessments={endpointAssessments} />
-                <RateLimitResults assessments={rateLimitAssessments} summary={summary} />
-                <BolaCorrelationResults
-                  assessments={bolaAssessments}
-                  baselines={bolaBaselines}
-                  activeTests={bolaActiveTests}
-                  summary={summary}
-                />
-                <GatewayBypassResults report={gatewayBypass} />
-              </CardContent>
-            </Card>
+            <Box component="details" sx={{ mt: 2 }}>
+              <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
+                Detailed security test results
+              </Box>
+              <Card sx={{ mt: 2 }}>
+                <CardContent>
+                  <Box component="details">
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Executive summary and coverage
+                    </Box>
+                    <ExecutiveSummary summary={summary} />
+                  </Box>
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Endpoint assessments and test cases
+                    </Box>
+                    <EndpointAssessments assessments={endpointAssessments} findings={findings} />
+                  </Box>
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Rate-limit results ({rateLimitAssessments.length})
+                    </Box>
+                    <RateLimitResults assessments={rateLimitAssessments} summary={summary} />
+                  </Box>
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      BOLA results
+                    </Box>
+                    <BolaCorrelationResults
+                      assessments={bolaAssessments}
+                      baselines={bolaBaselines}
+                      activeTests={bolaActiveTests}
+                      summary={summary}
+                    />
+                  </Box>
+                  <Box component="details" sx={{ mt: 2 }}>
+                    <Box component="summary" sx={{ cursor: 'pointer' }}>
+                      Gateway Bypass results
+                    </Box>
+                    <GatewayBypassResults report={gatewayBypass} />
+                  </Box>
+                </CardContent>
+              </Card>
+            </Box>
+              </>
+            )}
           </>
         )}
 
         {activePage === 'File Discovery' && (
           <>
             <Alert severity="info" sx={{ mb: 2 }}>
-              File and endpoint discovery now runs automatically from the main Scan action. This page remains an optional manual/debug tool; its findings also appear in the latest scan report.
+              Endpoint discovery is included in the main Scan workflow. Use this page to configure and run a focused discovery pass.
             </Alert>
             <Card>
               <CardContent>
@@ -2098,9 +2106,9 @@ function App() {
                 </Typography>
                 <Typography color="text.secondary" variant="body2" sx={{ mb: 2 }}>
                   The Scan target URL is used for discovery and endpoint verification without
-                  changing its scheme, host, or port. File Discovery remains restricted to
-                  local addresses. Discovered URLs on the same hostname may be scanned across
-                  different schemes or ports; other hostnames are excluded.
+                  changing its scheme, host, or port. File Discovery currently requires a
+                  loopback target on the scanner host. Discovered URLs on the same hostname
+                  may be scanned across different schemes or ports; other hostnames are excluded.
                   Redirects are not followed.
                 </Typography>
 
@@ -2583,14 +2591,14 @@ function App() {
                 Scanner Configuration
               </Typography>
               <Typography color="text.secondary" sx={{ mb: 3 }}>
-                Restrict the target to an authorized host, and discover endpoints using Kiterunner.
+                Configure the assessment target and API discovery options. Use targets that are within your approved assessment scope.
               </Typography>
 
               <Typography sx={{ mb: 1 }}>Scan target URL</Typography>
               <Box
                 component="input"
                 value={target}
-                placeholder="http://localhost:5000"
+                placeholder="https://api.example.com"
                 onChange={(event) => setTarget(event.target.value)}
                 sx={{
                   boxSizing: 'border-box',
@@ -2666,11 +2674,12 @@ function App() {
                 </Box>
               </Box>
               <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
-                Restricted to local services. The input URL and origins/ports found
-                in Discovery are treated as Gateways and excluded from service
-                candidates. Standard scans up to 65 ports around the input Gateway
-                port by default; enter both bounds for a custom range (up to 10,000
-                ports). Full scans ports 1–65535 automatically. Repeated
+                Gateway Bypass comparison currently supports loopback services on the
+                scanner host. The input URL and origins/ports found in Discovery are
+                treated as Gateways and excluded from service candidates. Standard scans
+                up to 65 ports around the input Gateway port by default; enter both
+                bounds for a custom range (up to 10,000 ports). Full scans ports 1–65535
+                automatically. Repeated
                 identifier-style routes contribute shared prefixes for service
                 verification; Standard compares other eligible routes, while Full
                 compares every eligible discovered route. No route-count cap applies.
