@@ -20,6 +20,7 @@ import {
   Typography,
   Card,
   CardContent,
+  Collapse,
   Table,
   TableBody,
   TableCell,
@@ -298,40 +299,49 @@ export function ApiTreeNode({ node, depth = 0 }) {
 }
 
 function DiscoveryProgress({ stages, loading }) {
+  const [expandedStage, setExpandedStage] = useState(null)
   if (stages.length === 0) return null
 
   return (
     <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mt: 2 }} aria-live="polite">
-      {stages.map((stage) => (
-        <Box key={stage.stage}>
-          <Chip
-            label={`${stage.stage}: ${stage.status}`}
-            size="small"
-            color={
-              stage.status === 'error' || stage.status === 'failed'
-                ? 'error'
-                : stage.status === 'completed'
-                  ? 'success'
-                  : stage.status === 'running'
-                    ? 'primary'
-                    : 'default'
-            }
-            variant={stage.status === 'running' ? 'filled' : 'outlined'}
-          />
-          {(stage.stage.includes('Discovery') ||
-            stage.stage === 'Authorized Scope' ||
-            stage.stage === 'API Origin Candidates' ||
-            stage.stage === 'Security Testing') && stage.detail && (
-            <Typography
-              color="text.secondary"
-              variant="caption"
-              sx={{ display: 'block', mt: 0.5 }}
-            >
-              {stage.detail}
-            </Typography>
-          )}
-        </Box>
-      ))}
+      {stages.map((stage) => {
+        const detailExpanded = expandedStage === stage.stage
+
+        return (
+          <Box key={stage.stage}>
+            <Chip
+              label={`${stage.stage}: ${stage.status}`}
+              size="small"
+              color={
+                stage.status === 'error' || stage.status === 'failed'
+                  ? 'error'
+                  : stage.status === 'completed'
+                    ? 'success'
+                    : stage.status === 'running'
+                      ? 'primary'
+                      : 'default'
+              }
+              variant={stage.status === 'running' ? 'filled' : 'outlined'}
+              onClick={stage.detail
+                ? () => setExpandedStage(detailExpanded ? null : stage.stage)
+                : undefined}
+              aria-expanded={stage.detail ? detailExpanded : undefined}
+              title={stage.detail ? 'Click to view stage details' : undefined}
+            />
+            {stage.detail && (
+              <Collapse in={detailExpanded} timeout="auto" unmountOnExit>
+                <Typography
+                  color="text.secondary"
+                  variant="caption"
+                  sx={{ display: 'block', mt: 0.5 }}
+                >
+                  {stage.detail}
+                </Typography>
+              </Collapse>
+            )}
+          </Box>
+        )
+      })}
       {loading && <CircularProgress size={18} aria-label="Scan in progress" />}
     </Box>
   )
@@ -763,7 +773,7 @@ function BolaCorrelationResults({ assessments, baselines, activeTests, summary }
         </Typography>
       )}
       <Typography variant="subtitle1" sx={{ mt: 3, fontWeight: 700 }}>
-        Active BOLA checks (authorized loopback lab)
+        Active BOLA checks (opt-in)
       </Typography>
       <Typography color="text.secondary" variant="body2" sx={{ mb: 1 }}>
         Sends bounded authenticated GET requests only to discovered detail routes, using identifiers observed in captured responses. Potential results do not establish authorization policy or resource ownership.
@@ -795,7 +805,7 @@ function BolaCorrelationResults({ assessments, baselines, activeTests, summary }
       ))}
       {activeTests.length === 0 && (
         <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
-          No active BOLA requests were recorded. Active checks require an opted-in loopback scan, an authenticated collection response, observed identifiers, and a discovered detail route.
+          No active BOLA requests were recorded. Active checks require an opted-in scan, an authenticated collection response, observed identifiers, and a discovered detail route.
         </Typography>
       )}
     </Box>
@@ -897,7 +907,7 @@ function GatewayBypassResults({ report }) {
       {report?.port_range && (
         <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
           Port range {report.port_range.start}–{report.port_range.end}; scanned{' '}
-          {report.ports_scanned ?? 0} non-Gateway loopback ports.
+          {report.ports_scanned ?? 0} non-Gateway service ports.
         </Typography>
       )}
       {report?.excluded_service_origins?.length > 0 && (
@@ -1372,6 +1382,12 @@ function ExecutiveSummary({ summary }) {
 function App() {
   const [target, setTarget] = useState('')
   const [scanMode, setScanMode] = useState('standard')
+  const [selectedModules, setSelectedModules] = useState({
+    jwt_authentication: false,
+    bola: false,
+    rate_limit: false,
+    gateway_bypass: false,
+  })
   const [gatewayBypassPortStart, setGatewayBypassPortStart] = useState('8000')
   const [gatewayBypassPortEnd, setGatewayBypassPortEnd] = useState('8100')
   const scanAbortController = useRef(null)
@@ -1431,12 +1447,13 @@ function App() {
     const scanTarget = targetOverride || target.trim()
     const isFollowupScan = Boolean(targetOverride)
     if (!scanTarget) {
-      setError('Enter a valid HTTP(S) target URL, for example http://localhost:5000.')
+      setError('Enter a valid HTTP(S) target URL, for example https://api.example.com.')
       return
     }
     if (
       !isFollowupScan
       && scanMode === 'standard'
+      && selectedModules.gateway_bypass
       && Boolean(gatewayBypassPortStart.trim()) !== Boolean(gatewayBypassPortEnd.trim())
     ) {
       setError('Enter both the start and end port, or leave both blank for the default range.')
@@ -1453,12 +1470,19 @@ function App() {
       const scanParams = new URLSearchParams({
         target: scanTarget,
         num: '200',
-        auto_jwt_local_lab: 'true',
+        auto_jwt_local_lab: String(
+          selectedModules.jwt_authentication || selectedModules.bola,
+        ),
         scan_mode: scanMode,
         stream: 'true',
+        jwt_testing: String(selectedModules.jwt_authentication),
+        bola_testing: String(selectedModules.bola),
+        rate_limit_testing: String(selectedModules.rate_limit),
+        gateway_bypass_testing: String(selectedModules.gateway_bypass),
       })
       if (
         !isFollowupScan
+        && selectedModules.gateway_bypass
         && gatewayBypassPortStart.trim()
         && gatewayBypassPortEnd.trim()
       ) {
@@ -1845,6 +1869,40 @@ function App() {
                   <MenuItem value="full">Full Scan</MenuItem>
                 </Select>
               </FormControl>
+              <Box sx={{ flex: '1 1 100%', mt: 1 }}>
+                <Typography variant="subtitle1" sx={{ mb: 0.5 }}>
+                  Security modules
+                </Typography>
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                  {[
+                    ['jwt_authentication', 'JWT / Authentication'],
+                    ['bola', 'BOLA'],
+                    ['rate_limit', 'Rate Limit'],
+                    ['gateway_bypass', 'Gateway Bypass'],
+                  ].map(([module, label]) => (
+                    <FormControlLabel
+                      key={module}
+                      disabled={loading}
+                      control={(
+                        <Checkbox
+                          checked={selectedModules[module]}
+                          onChange={(event) => {
+                            const checked = event.target.checked
+                            setSelectedModules((current) => ({
+                              ...current,
+                              [module]: checked,
+                            }))
+                          }}
+                        />
+                      )}
+                      label={label}
+                    />
+                  ))}
+                </Box>
+                <Typography color="text.secondary" variant="caption">
+                  Discovery always runs. Login/session setup is shared by the selected modules when needed.
+                </Typography>
+              </Box>
               <Box
                 component="button"
                 disabled={loading}
@@ -1893,6 +1951,14 @@ function App() {
               <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 1, mb: 3 }}>
                 {[
                   ['Scan mode', summary.scan_mode === 'full' ? 'Full Scan' : 'Standard Scan'],
+                  ['Security modules', (summary.enabled_modules ?? [])
+                    .map((module) => ({
+                      jwt_authentication: 'JWT / Authentication',
+                      bola: 'BOLA',
+                      rate_limit: 'Rate Limit',
+                      gateway_bypass: 'Gateway Bypass',
+                    })[module] ?? module)
+                    .join(', ') || 'Discovery only'],
                   ['Discovery inventory records', summary.discovery_inventory_records ?? summary.discovery_inventory_endpoints ?? scanDiscoveryResults.length],
                   ['Eligible API records', summary.security_input_endpoints ?? 0],
                   ['JWT-eligible endpoints', summary.jwt_eligible_endpoints ?? 0],
@@ -1998,8 +2064,8 @@ function App() {
                 <Typography color="text.secondary" variant="body2" sx={{ mb: 2 }}>
                   The Scan target URL is used for discovery and endpoint verification without
                   changing its scheme, host, or port. File Discovery remains restricted to
-                  localhost, 127.0.0.1, and ::1. Discovered URLs on the same hostname may be
-                  scanned across different schemes or ports; other hostnames are excluded.
+                  local addresses. Discovered URLs on the same hostname may be scanned across
+                  different schemes or ports; other hostnames are excluded.
                   Redirects are not followed.
                 </Typography>
 
@@ -2574,7 +2640,7 @@ function App() {
                 </Box>
               </Box>
               <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
-                Checks only localhost/loopback. The input URL and origins/ports found
+                Restricted to local services. The input URL and origins/ports found
                 in Discovery are treated as Gateways and excluded from service
                 candidates. Standard scans up to 65 ports around the input Gateway
                 port by default; enter both bounds for a custom range (up to 10,000

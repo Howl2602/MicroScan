@@ -1603,10 +1603,23 @@ async def _run_scan_pipeline(
     gateway_bypass_port_start=None,
     gateway_bypass_port_end=None,
     rate_limit_testing=True,
+    jwt_testing=True,
+    bola_testing=True,
+    gateway_bypass_testing=True,
 ):
     if scan_mode not in {"standard", "full"}:
         raise ValueError("scan_mode must be either 'standard' or 'full'.")
 
+    enabled_modules = [
+        module
+        for module, enabled in (
+            ("jwt_authentication", jwt_testing),
+            ("bola", bola_testing),
+            ("rate_limit", rate_limit_testing),
+            ("gateway_bypass", gateway_bypass_testing),
+        )
+        if enabled
+    ]
     normalized_target = validate_target(target)
     stages = {}
 
@@ -2395,6 +2408,7 @@ async def _run_scan_pipeline(
             failure_reason="All discovery stages failed before evidence collection.",
             scan_mode=scan_mode,
         )
+        report["summary"]["enabled_modules"] = enabled_modules
         _set_security_dispositions(
             discovery_results,
             report.get("endpoint_assessments", []),
@@ -2430,9 +2444,13 @@ async def _run_scan_pipeline(
 
     await emit(
         "Security Testing",
-        "running",
-        f"Evaluating {len(endpoints_for_testing)} eligible endpoint record(s) "
-        f"in {scan_mode.title()} Scan mode.",
+        "running" if any((jwt_testing, bola_testing, rate_limit_testing)) else "skipped",
+        (
+            f"Running {', '.join(enabled_modules)} on "
+            f"{len(endpoints_for_testing)} eligible endpoint record(s)."
+            if any((jwt_testing, bola_testing, rate_limit_testing))
+            else "No security modules were selected; Discovery only."
+        ),
     )
     security_progress_futures = []
     progress_loop = asyncio.get_running_loop()
@@ -2463,6 +2481,8 @@ async def _run_scan_pipeline(
             else None,
             cancellation_event=cancel_event,
             rate_limit_testing=rate_limit_testing,
+            jwt_testing=jwt_testing,
+            bola_testing=bola_testing,
         )
         if security_progress_futures:
             await asyncio.gather(
@@ -2481,6 +2501,7 @@ async def _run_scan_pipeline(
             failure_reason="Security testing failed after discovery.",
             scan_mode=scan_mode,
         )
+        report["summary"]["enabled_modules"] = enabled_modules
         _set_security_dispositions(
             discovery_results,
             report.get("endpoint_assessments", []),
@@ -2543,50 +2564,54 @@ async def _run_scan_pipeline(
         tested_count,
         request_count,
     )
-    await emit(
-        "Security Testing",
-        "completed",
-        f"Input {len(endpoints_for_testing)} endpoint(s); selected {selected_count}; "
-        f"actually tested {tested_count}; {request_count} request attempt(s).",
-    )
-    await emit(
-        "Gateway Bypass",
-        "running",
-        "Checking loopback ports against static GET endpoints from Discovery.",
-    )
-    try:
-        gateway_bypass = await GatewayBypass().analyze(
-            normalized_target,
-            discovery_results,
-            scan_mode=scan_mode,
-            port_start=gateway_bypass_port_start,
-            port_end=gateway_bypass_port_end,
-            progress_callback=emit,
+    if any((jwt_testing, bola_testing, rate_limit_testing)):
+        await emit(
+            "Security Testing",
+            "completed",
+            f"Input {len(endpoints_for_testing)} endpoint(s); selected {selected_count}; "
+            f"actually tested {tested_count}; {request_count} request attempt(s).",
         )
-    except ValueError as exc:
-        gateway_bypass = {
-            "status": "error",
-            "reason": str(exc),
-            "services": [],
-            "skipped_endpoints": [],
-        }
-        logger.warning(
-            "Gateway Bypass configuration failed | error=%s", type(exc).__name__
+    gateway_bypass = None
+    if gateway_bypass_testing:
+        await emit(
+            "Gateway Bypass",
+            "running",
+            "Checking local service ports against static GET endpoints from Discovery.",
         )
-    await emit(
-        "Gateway Bypass",
-        gateway_bypass["status"],
-        gateway_bypass.get("reason")
-        or (
-            f"Verified {len(gateway_bypass.get('services', []))} loopback service "
-            "origin(s) using discovered endpoints."
-        ),
-    )
+        try:
+            gateway_bypass = await GatewayBypass().analyze(
+                normalized_target,
+                discovery_results,
+                scan_mode=scan_mode,
+                port_start=gateway_bypass_port_start,
+                port_end=gateway_bypass_port_end,
+                progress_callback=emit,
+            )
+        except ValueError as exc:
+            gateway_bypass = {
+                "status": "error",
+                "reason": str(exc),
+                "services": [],
+                "skipped_endpoints": [],
+            }
+            logger.warning(
+                "Gateway Bypass configuration failed | error=%s", type(exc).__name__
+            )
+        await emit(
+            "Gateway Bypass",
+            gateway_bypass["status"],
+            gateway_bypass.get("reason")
+            or (
+                f"Verified {len(gateway_bypass.get('services', []))} local service "
+                "origin(s) using discovered endpoints."
+            ),
+        )
     report = build_pentest_report(
         analyzed,
         scan_mode=scan_mode,
         gateway_bypass=gateway_bypass,
     )
+    report["summary"]["enabled_modules"] = enabled_modules
     _set_security_dispositions(
         discovery_results,
         report.get("endpoint_assessments", []),
@@ -2954,6 +2979,9 @@ async def scan(
     gateway_bypass_port_start: int | None = None,
     gateway_bypass_port_end: int | None = None,
     rate_limit_testing: bool = True,
+    jwt_testing: bool = True,
+    bola_testing: bool = True,
+    gateway_bypass_testing: bool = True,
 ):
     if not stream:
         try:
@@ -2966,6 +2994,9 @@ async def scan(
                 gateway_bypass_port_start=gateway_bypass_port_start,
                 gateway_bypass_port_end=gateway_bypass_port_end,
                 rate_limit_testing=rate_limit_testing,
+                jwt_testing=jwt_testing,
+                bola_testing=bola_testing,
+                gateway_bypass_testing=gateway_bypass_testing,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2991,6 +3022,9 @@ async def scan(
                     gateway_bypass_port_start,
                     gateway_bypass_port_end,
                     rate_limit_testing,
+                    jwt_testing,
+                    bola_testing,
+                    gateway_bypass_testing,
                 )
                 await queue.put(
                     {"type": "complete", "status_code": status, "payload": payload}

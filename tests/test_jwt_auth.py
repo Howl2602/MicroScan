@@ -2124,9 +2124,9 @@ class AuthenticationTestTests(unittest.TestCase):
         self.assertFalse(not_confirmed[0]["jwt_selected"])
         self.assertIn("disabled for this scan", not_confirmed[0]["jwt_selection_reason"])
         self.assertFalse(non_local[0]["jwt_selected"])
-        self.assertIn("loopback target", non_local[0]["jwt_selection_reason"])
+        self.assertIn("host-local target", non_local[0]["jwt_selection_reason"])
         self.assertFalse(non_local_full[0]["jwt_selected"])
-        self.assertIn("loopback target", non_local_full[0]["jwt_selection_reason"])
+        self.assertIn("host-local target", non_local_full[0]["jwt_selection_reason"])
 
     @patch.dict(
         os.environ,

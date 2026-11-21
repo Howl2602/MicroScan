@@ -111,7 +111,7 @@ def normalize_origin(target: str) -> str:
     except ValueError:
         is_loopback = False
     if not is_loopback:
-        raise ValueError("File Discovery is limited to loopback targets.")
+        raise ValueError("File Discovery is limited to local targets.")
     try:
         parsed.port
     except ValueError as exc:

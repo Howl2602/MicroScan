@@ -14,6 +14,7 @@ from module.signin import LoginConfigurationError, Signin
 _UNSELECTED = object()
 _READ_ONLY_METHODS = {"GET"}
 _MAX_AUTOMATIC_JWT_ENDPOINTS = 5
+_MAX_AUTOMATIC_BOLA_ENDPOINTS = 5
 _MAX_CONFIGURED_JWT_ENDPOINTS = 100
 _MAX_AUTOMATIC_RATE_LIMIT_ENDPOINTS = 5
 _DEFAULT_ACTIVE_BOLA_REQUEST_BUDGET = 10
@@ -366,6 +367,48 @@ class Modules:
             grouped_path += "/"
         return grouped_path
 
+    def _rate_limit_candidates(self, endpoints):
+        unsuitable_segments = (
+            self.endpoint_selector.UNSUITABLE_PATH_SEGMENTS
+            | self.endpoint_selector.SENSITIVE_PATH_SEGMENTS
+            | self.endpoint_selector.REGISTRATION_PATH_SEGMENTS
+            | self.endpoint_selector.NON_LOGIN_AUTH_PATH_SEGMENTS
+        )
+        supported_classifications = {
+            "authentication",
+            "resource_collection",
+            "resource_by_id",
+            "user_or_account",
+        }
+        candidates = []
+        for discovery_index, endpoint in enumerate(endpoints):
+            if endpoint.get("discovery_source") != "discovery":
+                continue
+            identity = (
+                str(endpoint.get("method") or "").upper(),
+                endpoint.get("path"),
+            )
+            if identity[0] != "GET" or endpoint.get("jwt_path_error"):
+                continue
+            path = identity[1]
+            if not isinstance(path, str):
+                continue
+            segments = self.endpoint_selector._path_segments(path)
+            if not segments or any(
+                segment in unsuitable_segments for segment in segments
+            ):
+                continue
+            if _DYNAMIC_PATH_SEGMENT.search(path):
+                continue
+            classification = self.endpoint_selector.classify_endpoint(endpoint)[
+                "classification"
+            ]
+            if classification in supported_classifications:
+                candidates.append(
+                    (discovery_index, endpoint, identity, classification)
+                )
+        return candidates
+
     @staticmethod
     def _automatic_endpoint_priority(endpoint, discovery_index):
         status = EndpointSelector.discovery_status(endpoint)
@@ -428,6 +471,8 @@ class Modules:
         progress_callback=None,
         cancellation_event=None,
         rate_limit_testing=False,
+        jwt_testing=True,
+        bola_testing=True,
     ):
         if scan_mode not in {"standard", "full"}:
             raise ValueError("scan_mode must be either 'standard' or 'full'.")
@@ -465,7 +510,7 @@ class Modules:
             )
             analyzed.append(endpoint)
 
-        allowlist = self._endpoint_allowlist()
+        allowlist = self._endpoint_allowlist() if jwt_testing else []
         allowlist_set = set(allowlist)
         authentication_inventory = (
             discovered_inventory
@@ -477,7 +522,9 @@ class Modules:
             for endpoint in analyzed
         }
         active_bola_enabled = bool(
-            auto_jwt_local_lab and self._is_local_target(target)
+            bola_testing
+            and auto_jwt_local_lab
+            and self._is_local_target(target)
         )
         active_bola_budget = (
             {
@@ -525,7 +572,11 @@ class Modules:
             "used": None,
             "remaining": None,
         }
-        if allowlist:
+        if not jwt_testing:
+            selection_mode = "not_selected"
+            selection_budget["mode"] = selection_mode
+            auto_mode_reason = "JWT authentication was not selected for this scan."
+        elif allowlist:
             selection_mode = "explicit_allowlist"
             selection_budget["mode"] = selection_mode
             eligible_identities = {
@@ -627,7 +678,7 @@ class Modules:
             selection_mode = "blocked_non_local_target"
             selection_budget["mode"] = selection_mode
             auto_mode_reason = (
-                "Automatic JWT testing is restricted to loopback targets "
+                "Automatic JWT testing is restricted to host-local targets "
                 "(localhost, 127.0.0.0/8, or ::1)."
             )
         else:
@@ -638,7 +689,84 @@ class Modules:
                 "endpoint allowlist to test specific discovered endpoints."
             )
 
+        rate_limit_candidates = self._rate_limit_candidates(analyzed)
+        bola_candidates = []
+        for discovery_index, endpoint in enumerate(analyzed):
+            if (
+                endpoint.get("discovery_source") != "discovery"
+                or str(endpoint.get("method") or "").upper() != "GET"
+                or endpoint.get("jwt_path_error")
+            ):
+                continue
+            resource_route = BolaAnalyzer._resource_route(endpoint)
+            if (
+                resource_route
+                and resource_route["resource_type"] in BolaAnalyzer.COLLECTION_TYPES
+            ):
+                bola_candidates.append((discovery_index, endpoint, resource_route))
+        ordered_bola_candidates = sorted(
+            bola_candidates,
+            key=lambda candidate: (
+                0 if candidate[2]["is_collection"] else 1,
+                candidate[0],
+            ),
+        )
+        bola_limit = (
+            None
+            if scan_mode == "full"
+            else _MAX_AUTOMATIC_BOLA_ENDPOINTS
+        )
+        selected_bola_groups = set()
+        selected_bola_endpoints = set()
+        for _, endpoint, _ in ordered_bola_candidates:
+            identity = (
+                str(endpoint.get("method") or "").upper(),
+                endpoint.get("path"),
+            )
+            group = (identity[0], self._automatic_route_group(identity[1]))
+            if group in selected_bola_groups:
+                continue
+            if bola_limit is not None and len(selected_bola_groups) >= bola_limit:
+                break
+            selected_bola_groups.add(group)
+            selected_bola_endpoints.add(identity)
+
         self.authentication_test.reset_scan_state()
+        shared_session = None
+        needs_shared_session = bool(
+            (jwt_testing and selected_reasons)
+            or (rate_limit_testing and rate_limit_candidates)
+            or (
+                bola_testing
+                and selected_bola_endpoints
+                and (not jwt_testing or not selected_reasons)
+            )
+        )
+        if needs_shared_session:
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": "Authentication Setup",
+                        "status": "running",
+                        "detail": "Preparing one authenticated session for selected modules.",
+                    }
+                )
+            shared_session = self.authentication_test.prepare_authenticated_session(
+                target,
+                authentication_inventory,
+            )
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": "Authentication Setup",
+                        "status": (
+                            "completed"
+                            if shared_session["available"]
+                            else "skipped"
+                        ),
+                        "detail": shared_session["reason"],
+                    }
+                )
         try:
             selected_count = len(selected_reasons)
             for index, endpoint in enumerate(analyzed, start=1):
@@ -666,6 +794,12 @@ class Modules:
                             }
                         )
 
+                if not jwt_testing:
+                    endpoint["jwt_selected"] = False
+                    endpoint["jwt_selection_reason"] = (
+                        "JWT authentication was not selected for this scan."
+                    )
+                    continue
                 if endpoint.get("discovery_source") == "configured_allowlist":
                     endpoint["jwt_selected"] = False
                     endpoint["jwt_selection_reason"] = (
@@ -774,46 +908,7 @@ class Modules:
                 )
                 endpoint["test_results"].append(result)
                 report_progress()
-            discovered_rate_candidates = []
-            unsuitable_segments = (
-                self.endpoint_selector.UNSUITABLE_PATH_SEGMENTS
-                | self.endpoint_selector.SENSITIVE_PATH_SEGMENTS
-                | self.endpoint_selector.REGISTRATION_PATH_SEGMENTS
-                | self.endpoint_selector.NON_LOGIN_AUTH_PATH_SEGMENTS
-            )
-            supported_classifications = {
-                "authentication",
-                "resource_collection",
-                "resource_by_id",
-                "user_or_account",
-            }
-            for discovery_index, endpoint in enumerate(analyzed):
-                if endpoint.get("discovery_source") != "discovery":
-                    continue
-                identity = (
-                    str(endpoint.get("method") or "").upper(),
-                    endpoint.get("path"),
-                )
-                if identity[0] != "GET" or endpoint.get("jwt_path_error"):
-                    continue
-                path = identity[1]
-                if not isinstance(path, str):
-                    continue
-                segments = self.endpoint_selector._path_segments(path)
-                if not segments or any(
-                    segment in unsuitable_segments for segment in segments
-                ):
-                    continue
-                if _DYNAMIC_PATH_SEGMENT.search(path):
-                    continue
-                classification = self.endpoint_selector.classify_endpoint(endpoint)[
-                    "classification"
-                ]
-                if classification not in supported_classifications:
-                    continue
-                discovered_rate_candidates.append(
-                    (discovery_index, endpoint, identity, classification)
-                )
+            discovered_rate_candidates = rate_limit_candidates
 
             if rate_limit_testing:
                 rate_limit_selection = "user_opt_in"
@@ -931,7 +1026,128 @@ class Modules:
                             ),
                         }
                     )
-            bola_data = BolaAnalyzer(self.endpoint_selector).analyze(analyzed)
+            if bola_testing:
+                cached_headers = (
+                    self.authentication_test.get_cached_authenticated_headers(target)
+                )
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "stage": "BOLA Testing",
+                            "status": "running",
+                            "detail": (
+                                f"Collecting authenticated evidence from "
+                                f"{len(selected_bola_endpoints)} selected endpoint group(s)."
+                            ),
+                        }
+                    )
+                for _, endpoint, resource_route in ordered_bola_candidates:
+                    identity = (
+                        str(endpoint.get("method") or "").upper(),
+                        endpoint.get("path"),
+                    )
+                    is_selected = identity in selected_bola_endpoints
+                    endpoint["bola_selected"] = is_selected
+                    endpoint["bola_selection_reason"] = (
+                        "Selected for authenticated BOLA evidence collection."
+                        if is_selected
+                        else "BOLA endpoint-group selection limit was reached."
+                    )
+                    if not is_selected:
+                        continue
+
+                    endpoint["applicable_tests"] = list(
+                        dict.fromkeys(
+                            endpoint["applicable_tests"]
+                            + [EndpointSelector.BOLA_MODULE]
+                        )
+                    )
+                    if BolaAnalyzer._response_evidence(endpoint) is None:
+                        if cached_headers:
+                            endpoint["authenticated_session_check"] = (
+                                self.authentication_test.probe_authenticated_endpoint(
+                                    target,
+                                    endpoint,
+                                    cached_headers,
+                                )
+                            )
+                            endpoint["shared_authentication"] = (
+                                shared_session["discovery"]
+                                if shared_session
+                                else {}
+                            )
+                        elif not any(
+                            result.get("test_module") == self.TEST_MODULE
+                            for result in endpoint["test_results"]
+                        ):
+                            reason = (
+                                shared_session["reason"]
+                                if shared_session
+                                else "No authenticated session was established for this scan."
+                            )
+                            endpoint["authenticated_session_check"] = {
+                                "status": "skipped",
+                                "request_attempted": False,
+                                "reason": reason,
+                                "evidence": None,
+                            }
+                            endpoint["shared_authentication"] = (
+                                shared_session["discovery"]
+                                if shared_session
+                                else {}
+                            )
+
+                    if (
+                        active_bola_enabled
+                        and resource_route["is_collection"]
+                        and active_bola_budget is not None
+                        and not any(
+                            result.get("active_bola_tests")
+                            for result in endpoint["test_results"]
+                        )
+                    ):
+                        endpoint["active_bola_tests"] = (
+                            self.authentication_test._active_bola_test_results(
+                                target=target,
+                                collection_path=resource_route["collection_path"],
+                                resource_type=resource_route["resource_type"],
+                                route_templates=[
+                                    route
+                                    for route in active_bola_route_templates
+                                    if route["collection_path"]
+                                    == resource_route["collection_path"]
+                                ],
+                                responses={},
+                                authenticated_evidence=(
+                                    BolaAnalyzer._response_evidence(endpoint)
+                                ),
+                                authenticated_headers=cached_headers,
+                                budget_state=active_bola_budget,
+                            )
+                        )
+                bola_data = BolaAnalyzer(self.endpoint_selector).analyze(analyzed)
+                if progress_callback:
+                    active_test_count = sum(
+                        len(endpoint.get("active_bola_tests", []))
+                        + sum(
+                            len(result.get("active_bola_tests", []))
+                            for result in endpoint.get("test_results", [])
+                        )
+                        for endpoint in analyzed
+                    )
+                    progress_callback(
+                        {
+                            "stage": "BOLA Testing",
+                            "status": "completed",
+                            "detail": (
+                                f"Produced {len(bola_data['assessments'])} passive assessment(s) "
+                                f"and {active_test_count} "
+                                "active detail-check record(s)."
+                            ),
+                        }
+                    )
+            else:
+                bola_data = {"baselines": [], "assessments": []}
             endpoints_by_identity = {
                 (endpoint.get("method"), endpoint.get("path")): endpoint
                 for endpoint in analyzed

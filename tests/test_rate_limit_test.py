@@ -8,8 +8,21 @@ from module.pentest_report import build_pentest_report
 
 
 class StubAuthenticationTest:
+    def __init__(self):
+        self.prepared = False
+        self.evaluated = []
+
     def reset_scan_state(self):
         pass
+
+    def prepare_authenticated_session(self, target, discovered_endpoints):
+        self.prepared = True
+        return {
+            "available": False,
+            "headers": None,
+            "discovery": {},
+            "reason": "No configured test session.",
+        }
 
     def get_cached_authenticated_headers(self, target):
         return None
@@ -23,6 +36,7 @@ class StubAuthenticationTest:
         }
 
     def evaluate(self, target, selected_candidate, discovered_endpoints):
+        self.evaluated.append(selected_candidate["path"])
         return {
             "test_module": "jwt_authentication",
             "status": "skipped",
@@ -286,6 +300,55 @@ class RateLimitTestTests(unittest.TestCase):
         self.assertEqual(rate_limit.calls, [])
         self.assertFalse(analyzed[0]["rate_limit_selected"])
         self.assertEqual(analyzed[0]["rate_limit_selection_mode"], "not_enabled")
+
+    def test_no_selected_modules_skips_authenticated_and_rate_limit_requests(self):
+        authentication = StubAuthenticationTest()
+        rate_limit = StubRateLimitTest()
+        analyzed = Modules(
+            authentication_test=authentication,
+            rate_limit_test=rate_limit,
+        ).analyze_endpoints(
+            "https://api.example.test",
+            [{"method": "GET", "path": "/api/orders"}],
+            jwt_testing=False,
+            bola_testing=False,
+            rate_limit_testing=False,
+        )
+
+        self.assertFalse(authentication.prepared)
+        self.assertEqual(authentication.evaluated, [])
+        self.assertEqual(rate_limit.calls, [])
+        self.assertEqual(analyzed[0]["test_results"], [])
+
+    def test_rate_limit_module_runs_without_jwt_probes(self):
+        authentication = StubAuthenticationTest()
+        rate_limit = StubRateLimitTest()
+        analyzed = Modules(
+            authentication_test=authentication,
+            rate_limit_test=rate_limit,
+        ).analyze_endpoints(
+            "https://api.example.test",
+            [{"method": "GET", "path": "/api/orders"}],
+            jwt_testing=False,
+            bola_testing=False,
+            rate_limit_testing=True,
+        )
+
+        self.assertTrue(authentication.prepared)
+        self.assertEqual(authentication.evaluated, [])
+        self.assertEqual(len(rate_limit.calls), 1)
+        self.assertFalse(
+            any(
+                result["test_module"] == "jwt_authentication"
+                for result in analyzed[0]["test_results"]
+            )
+        )
+        self.assertTrue(
+            any(
+                result["test_module"] == "rate_limit"
+                for result in analyzed[0]["test_results"]
+            )
+        )
 
     def test_full_mode_enforces_scan_wide_request_budget(self):
         rate_limit = StubRateLimitTest()

@@ -319,6 +319,175 @@ class AuthenticationTest:
             )
         raise LoginError(reason, status_code=last_status)
 
+    def prepare_authenticated_session(self, target, discovered_endpoints=None):
+        login_candidates = self.endpoint_selector.discover_login_candidates(
+            discovered_endpoints
+        )
+        discovery = {
+            "discovered_login_endpoints": [
+                {
+                    "method": item.get("method"),
+                    "path": item.get("path"),
+                    "discovery_status": item.get("discovery_status"),
+                    "evidence_source": item.get("evidence_source", []),
+                    "allow_header_methods": item.get("allow_header_methods", []),
+                    "request_content_type": item.get("request_content_type"),
+                    "inferred_post_from_get_405": item.get(
+                        "inferred_post_from_get_405", False
+                    ),
+                }
+                for item in login_candidates
+            ],
+            "login_discovery_status": "found" if login_candidates else "not_found",
+            "login_attempt_status": "not_attempted",
+            "authentication_result": "unavailable",
+            "token_or_session_detected": False,
+            "selected_login_route": None,
+            "selected_login_method": None,
+            "selected_login_evidence_source": [],
+            "login_attempts": [],
+            "note": "Shared authentication setup runs before selected security modules.",
+        }
+        try:
+            auth_config, discovered_login_candidates, configuration_note = (
+                Signin.configured_auth(
+                    discovered_endpoints,
+                    allow_inferred_credentials=Signin.is_loopback_target(target),
+                )
+            )
+            if auth_config is None:
+                discovery["login_attempt_status"] = "unavailable"
+                discovery["note"] = configuration_note
+                return {
+                    "available": False,
+                    "headers": None,
+                    "discovery": discovery,
+                    "reason": configuration_note,
+                }
+
+            discovery["discovered_login_endpoints"] = [
+                {
+                    "method": item.get("method"),
+                    "path": item.get("path"),
+                    "discovery_status": item.get("discovery_status"),
+                    "evidence_source": item.get("evidence_source", []),
+                    "allow_header_methods": item.get("allow_header_methods", []),
+                    "request_content_type": item.get("request_content_type"),
+                    "inferred_post_from_get_405": item.get(
+                        "inferred_post_from_get_405", False
+                    ),
+                }
+                for item in discovered_login_candidates
+            ]
+            discovery["login_discovery_status"] = (
+                "found" if discovered_login_candidates else "not_found"
+            )
+            token_info = self._signin_candidates(
+                target,
+                auth_config,
+                discovered_login_candidates,
+                discovery,
+            )
+            token = token_info.get("token")
+            cookie = token_info.get("cookie")
+            discovery["token_or_session_detected"] = bool(token or cookie)
+            discovery["authentication_mechanism"] = token_info.get(
+                "mechanism", "unknown"
+            )
+            if cookie:
+                headers = {"Cookie": cookie}
+            elif token and token_info.get("auth_scheme"):
+                auth_header = token_info.get("auth_header", "Authorization")
+                if not re.fullmatch(r"[A-Za-z0-9-]+", auth_header):
+                    raise LoginConfigurationError(
+                        "Configured auth_header is invalid."
+                    )
+                headers = {
+                    auth_header: f"{token_info['auth_scheme']} {token}"
+                }
+            else:
+                reason = (
+                    "Login succeeded, but no usable authorization scheme or session "
+                    "cookie was available."
+                )
+                discovery["authentication_result"] = "unavailable"
+                discovery["note"] = reason
+                return {
+                    "available": False,
+                    "headers": None,
+                    "discovery": discovery,
+                    "reason": reason,
+                }
+        except LoginError as exc:
+            discovery["login_attempt_status"] = (
+                "failed"
+                if any(
+                    item.get("status") == "failed"
+                    for item in discovery["login_attempts"]
+                )
+                else "unavailable"
+            )
+            discovery["note"] = str(exc)
+            return {
+                "available": False,
+                "headers": None,
+                "discovery": discovery,
+                "reason": str(exc),
+            }
+
+        discovery["authentication_result"] = "success"
+        origin = Signin.normalize_target(target)
+        self._authenticated_headers[origin] = dict(headers)
+        return {
+            "available": True,
+            "headers": dict(headers),
+            "discovery": discovery,
+            "reason": "Configured login established a session for selected modules.",
+        }
+
+    def probe_authenticated_endpoint(self, target, endpoint, headers):
+        method = str(endpoint.get("method") or "GET").upper()
+        path = endpoint.get("path") or "/"
+        if method != "GET":
+            return {
+                "status": "skipped",
+                "request_attempted": False,
+                "reason": "Authenticated BOLA evidence uses GET endpoints only.",
+                "evidence": None,
+            }
+        try:
+            url = self._scope_url(target, path)
+            response = self._run_http_request(method, url, headers=headers)
+        except (LoginConfigurationError, ValueError) as exc:
+            return {
+                "status": "error",
+                "request_attempted": False,
+                "reason": str(exc),
+                "evidence": None,
+            }
+        except httpx.TimeoutException:
+            return {
+                "status": "error",
+                "request_attempted": True,
+                "reason": "Authenticated endpoint request timed out.",
+                "evidence": None,
+            }
+        except httpx.RequestError:
+            return {
+                "status": "error",
+                "request_attempted": True,
+                "reason": (
+                    "Authenticated endpoint request failed to reach the configured target."
+                ),
+                "evidence": None,
+            }
+        return {
+            "status": "tested",
+            "request_attempted": True,
+            "reason": "Authenticated session was used for the discovered GET endpoint.",
+            "evidence": self._response_evidence(response),
+        }
+
     @staticmethod
     def _scope_url(target, path):
         origin = Signin.normalize_target(target)

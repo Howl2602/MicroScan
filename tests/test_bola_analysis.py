@@ -507,6 +507,23 @@ class BolaAnalyzerTests(unittest.TestCase):
                 return None
 
             @staticmethod
+            def prepare_authenticated_session(target, discovered_endpoints):
+                return {
+                    "available": False,
+                    "headers": None,
+                    "discovery": {},
+                    "reason": "No configured test session.",
+                }
+
+            @staticmethod
+            def get_cached_authenticated_headers(target):
+                return None
+
+            @staticmethod
+            def _active_bola_test_results(**kwargs):
+                return []
+
+            @staticmethod
             def skipped_result(endpoint_data, reason):
                 return {
                     "test_module": "jwt_authentication",
@@ -558,6 +575,66 @@ class BolaAnalyzerTests(unittest.TestCase):
         self.assertEqual(report["summary"]["bola_assessment_count"], 1)
         self.assertEqual(report["summary"]["bola_potential_count"], 1)
 
+    def test_bola_runs_without_jwt_probes_using_shared_authenticated_session(self):
+        class SharedSessionAuthentication:
+            def __init__(self):
+                self.probed = []
+
+            @staticmethod
+            def reset_scan_state():
+                return None
+
+            @staticmethod
+            def prepare_authenticated_session(target, discovered_endpoints):
+                return {
+                    "available": True,
+                    "headers": {"Authorization": "Bearer test-token"},
+                    "discovery": {"login_attempt_status": "succeeded"},
+                    "reason": "Session ready.",
+                }
+
+            @staticmethod
+            def get_cached_authenticated_headers(target):
+                return {"Authorization": "Bearer test-token"}
+
+            def probe_authenticated_endpoint(self, target, endpoint, headers):
+                self.probed.append(endpoint["path"])
+                identifiers = (
+                    [
+                        identifier(1, path="$.orders[0]"),
+                        identifier(2, path="$.orders[1]"),
+                    ]
+                    if endpoint["path"] == "/api/orders"
+                    else [identifier(7)]
+                )
+                return {
+                    "status": "tested",
+                    "request_attempted": True,
+                    "reason": "Authenticated evidence captured.",
+                    "evidence": captured_evidence(identifiers),
+                }
+
+            @staticmethod
+            def evaluate(*args, **kwargs):
+                raise AssertionError("JWT probes must not run when JWT is unselected.")
+
+        authentication = SharedSessionAuthentication()
+        analyzed = Modules(authentication_test=authentication).analyze_endpoints(
+            "https://api.example.test",
+            [
+                {"method": "GET", "path": "/api/orders"},
+                {"method": "GET", "path": "/api/orders/7"},
+            ],
+            jwt_testing=False,
+            bola_testing=True,
+            rate_limit_testing=False,
+        )
+
+        self.assertEqual(authentication.probed, ["/api/orders", "/api/orders/7"])
+        self.assertTrue(all(not endpoint["test_results"] for endpoint in analyzed))
+        self.assertTrue(any(endpoint.get("bola_baseline") for endpoint in analyzed))
+        self.assertTrue(any(endpoint.get("bola_assessment") for endpoint in analyzed))
+
     def test_pipeline_sends_authenticated_check_to_one_representative_id_route(self):
         class RecordingAuthentication:
             def __init__(self):
@@ -566,6 +643,23 @@ class BolaAnalyzerTests(unittest.TestCase):
             @staticmethod
             def reset_scan_state():
                 return None
+
+            @staticmethod
+            def prepare_authenticated_session(target, discovered_endpoints):
+                return {
+                    "available": False,
+                    "headers": None,
+                    "discovery": {},
+                    "reason": "No configured test session.",
+                }
+
+            @staticmethod
+            def get_cached_authenticated_headers(target):
+                return None
+
+            @staticmethod
+            def _active_bola_test_results(**kwargs):
+                return []
 
             @staticmethod
             def skipped_result(endpoint_data, reason):
@@ -1043,7 +1137,8 @@ class BolaAnalyzerTests(unittest.TestCase):
             )
 
         def cancel_after_first_endpoint(event):
-            cancellation_event.set()
+            if event["stage"] == "Security Testing":
+                cancellation_event.set()
 
         endpoints = [
             {"method": "GET", "path": path, "responses": [{"sc": 200}]}

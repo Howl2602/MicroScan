@@ -93,7 +93,7 @@ class GatewayBypass:
         origin = cls._origin_parts(target)
         if origin is None or not cls._is_loopback(origin["hostname"]):
             raise ValueError(
-                "Gateway Bypass active checks are limited to loopback gateway targets."
+                "Gateway Bypass active checks are limited to host-local gateway targets."
             )
         return origin
 
@@ -231,7 +231,7 @@ class GatewayBypass:
                         "path": route_path,
                         "reason": (
                             "Active Gateway and service checks are limited to "
-                            "loopback origins."
+                            "same-machine origins."
                         ),
                     }
                 )
@@ -614,7 +614,7 @@ class GatewayBypass:
         if not loopback_gateways:
             return {
                 "status": "inconclusive",
-                "reason": "Discovery did not provide loopback Gateway origins to compare.",
+                "reason": "Discovery did not provide local Gateway origins to compare.",
                 "scan_mode": scan_mode,
                 "port_range": {
                     "start": candidate_port_range.start,
@@ -776,7 +776,7 @@ class GatewayBypass:
                         "method": endpoint["method"],
                         "path": endpoint["path"],
                         "reason": (
-                            "The loopback hostname could not be resolved; its ports "
+                            "The local hostname could not be resolved; its ports "
                             "were not checked."
                         ),
                     }
@@ -815,12 +815,12 @@ class GatewayBypass:
                 "status": "inconclusive",
                 "reason": (
                     (
-                        "Could not resolve loopback host(s): "
+                        "Could not resolve local host(s): "
                         + ", ".join(sorted(set(unresolved_hosts)))
                         + "; their ports were not checked."
                     )
                     if unresolved_hosts
-                    else "No HTTP-listening ports were found in the selected loopback port range after excluding Gateway ports."
+                    else "No HTTP-listening ports were found in the selected local port range after excluding Gateway ports."
                 ),
                 "scan_mode": scan_mode,
                 "port_range": {

@@ -81,6 +81,11 @@ class BolaAnalyzer:
 
     @staticmethod
     def _response_evidence(endpoint):
+        shared_check = endpoint.get("authenticated_session_check")
+        if isinstance(shared_check, dict) and isinstance(
+            shared_check.get("evidence"), dict
+        ):
+            return shared_check["evidence"]
         for result in endpoint.get("test_results", []) or []:
             if not isinstance(result, dict) or result.get("test_module") != "jwt_authentication":
                 continue
@@ -109,6 +114,13 @@ class BolaAnalyzer:
             ),
             {},
         )
+        if not jwt_result and isinstance(
+            endpoint.get("authenticated_session_check"), dict
+        ):
+            jwt_result = {
+                "authenticated_check": endpoint["authenticated_session_check"],
+                "discovery": endpoint.get("shared_authentication", {}),
+            }
         authenticated_check = jwt_result.get("authenticated_check")
         authenticated_check = (
             authenticated_check if isinstance(authenticated_check, dict) else None
@@ -150,7 +162,8 @@ class BolaAnalyzer:
             evidence.get("content_type") if isinstance(evidence, dict) else None
         )
         selection_reason = (
-            endpoint.get("jwt_selection_reason")
+            endpoint.get("bola_selection_reason")
+            or endpoint.get("jwt_selection_reason")
             or jwt_result.get("endpoint_selection_reason")
             or jwt_result.get("reason")
         )
@@ -181,7 +194,10 @@ class BolaAnalyzer:
                 capture_outcome = "captured_json_resource_evidence"
                 skip_reason = None
             request_outcome = "response_captured"
-        elif endpoint.get("jwt_selected") is False:
+        elif (
+            endpoint.get("jwt_selected") is False
+            and endpoint.get("bola_selected") is not True
+        ):
             capture_outcome = "authenticated_request_not_sent"
             request_outcome = "not_attempted"
             selection_text = str(selection_reason or "").lower()
