@@ -91,6 +91,67 @@ class KiterunnerSeedScanTests(unittest.TestCase):
         self.assertEqual(command[1:3], ["scan", "localhost:8085"])
         self.assertEqual(outcome["target"], "http://localhost:8085")
         self.assertEqual(outcome["command"], command)
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            KiteRunner.DEFAULT_SCAN_TIMEOUT_SECONDS,
+        )
+
+    @patch("discovery.kiterunner.subprocess.run")
+    def test_selected_wordlist_is_bounded_compiled_and_scanned(self, run):
+        commands = []
+        compiled_paths = []
+
+        def run_command(command, **kwargs):
+            commands.append(command)
+            if command[1:3] == ["kb", "convert"]:
+                compiled_paths.append(Path(command[3]).read_text(encoding="utf-8"))
+                Path(command[4]).write_bytes(b"compiled")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps({"method": "GET", "path": "/api/users"}),
+                "",
+            )
+
+        run.side_effect = run_command
+        outcome = KiteRunner().kiterunner_scan(
+            "http://localhost:8085",
+            3,
+            return_outcome=True,
+            timeout_seconds=20,
+            wordlist=(
+                "/api/users\n"
+                "api/orders\n"
+                "/api/:id\n"
+                "/api/inventory\n"
+                "/api/ignored\n"
+                "/api/users\n"
+            ),
+        )
+
+        self.assertEqual(
+            compiled_paths,
+            ["/api/users\n/api/orders\n/api/inventory\n"],
+        )
+        self.assertEqual(len(commands), 2)
+        scan_command = commands[1]
+        self.assertEqual(scan_command[1:3], ["scan", "localhost:8085"])
+        self.assertIn("-w", scan_command)
+        self.assertNotIn("-A=apiroutes-260227:3", scan_command)
+        self.assertEqual(outcome["wordlist_entries"], 3)
+        self.assertEqual(outcome["result_count"], 1)
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], 20)
+
+    @patch("discovery.kiterunner.subprocess.run")
+    def test_custom_wordlist_with_no_static_paths_fails_without_execution(self, run):
+        with self.assertRaisesRegex(ValueError, "no static paths"):
+            KiteRunner().kiterunner_scan(
+                "http://localhost:8085",
+                100,
+                wordlist="/api/:id\n/api/search?active=true\n",
+            )
+        run.assert_not_called()
 
     @patch("discovery.kiterunner.subprocess.run")
     def test_seeded_scan_failure_reports_command_exit_and_diagnostics(self, run):

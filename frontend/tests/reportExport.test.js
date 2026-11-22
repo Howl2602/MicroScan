@@ -93,7 +93,7 @@ test('exports all report sections and keeps the original report unchanged', () =
   assert.match(html, /charset="utf-8"/)
   assert.match(html, /Cần xem xét/)
   assert.match(html, /Dữ liệu minh chứng/)
-  assert.match(html, /Offline remediation guidance/)
+  assert.match(html, /Khuyến nghị khắc phục/)
   assert.match(html, /Enforce object-level authorization\./)
   assert.match(html, /Verify another user cannot access this object\./)
   assert.match(html, /Ngoài phạm vi kiểm thử/)
@@ -113,6 +113,40 @@ test('exports all report sections and keeps the original report unchanged', () =
   assert.match(html, /status_changed/)
   assert.match(html, /Authorized endpoints/)
   assert.doesNotMatch(html, /coverage_limitations|Some discovered endpoints were not actually tested|One or more test cases were skipped|Some JWT test cases are not implemented|Gateway Bypass did not complete with comparable service evidence/)
+  assert.deepEqual(report, original)
+})
+
+test('localizes known recommendations and remediation guidance without changing report data', () => {
+  const report = {
+    findings: [{
+      test_case: 'active_bola_detail',
+      name: 'Potential authorization weakness',
+      method: 'GET',
+      endpoint: '/api/items/1',
+      recommendation: "Review the endpoint's authorization policy.",
+      remediation: {
+        root_cause: 'An authenticated request returned data for an identifier outside the captured collection baseline; verify object-level authorization.',
+        actions: ['Constrain resource lookups by owner, tenant, or an explicit access policy.'],
+        retest_steps: ["With two test accounts, confirm account A cannot read account B's object."],
+        suggested_priority: 'high',
+        limitation: 'An out-of-baseline response alone does not establish ownership or intended access policy.',
+        note: 'Offline, rule-based guidance. Suggested priority is triage assistance, not a severity assessment; validate recommendations against the application.',
+      },
+    }],
+  }
+  const original = structuredClone(report)
+  const html = createReportHtml(report)
+
+  assert.match(html, /Khả năng có điểm yếu trong phân quyền/)
+  assert.match(html, /Khuyến nghị:/)
+  assert.match(html, /Rà soát chính sách phân quyền của endpoint\./)
+  assert.match(html, /Nguyên nhân có thể:/)
+  assert.match(html, /Hành động đề xuất:/)
+  assert.match(html, /Giới hạn:/)
+  assert.match(html, /Mức ưu tiên đề xuất:<\/strong> cao/)
+  assert.match(html, /Giới hạn truy vấn tài nguyên theo chủ sở hữu/)
+  assert.match(html, /Dùng hai tài khoản kiểm thử/)
+  assert.doesNotMatch(html, /An authenticated request returned data/)
   assert.deepEqual(report, original)
 })
 

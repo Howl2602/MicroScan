@@ -202,7 +202,7 @@ class AuthenticationTest:
                     for candidate in eligible_candidates
                     if candidate.get("path") == configured_login_path
                 ]
-            candidates_to_try = eligible_candidates[:Signin.MAX_LOGIN_CANDIDATES]
+            candidates_to_try = eligible_candidates
         elif configuration.get("explicit_login_endpoint") or not candidates:
             configured_path = configuration.get("login_endpoint")
             if not configured_path:
@@ -224,7 +224,7 @@ class AuthenticationTest:
                 }
             ]
         else:
-            candidates_to_try = candidates[:Signin.MAX_LOGIN_CANDIDATES]
+            candidates_to_try = candidates
 
         last_status = None
         for candidate in candidates_to_try:
@@ -313,8 +313,8 @@ class AuthenticationTest:
                 for item in discovery["login_attempts"]
             ]
             reason = (
-                "Automatic login failed or could not run for eligible candidates within the "
-                f"{Signin.MAX_LOGIN_CANDIDATES}-request limit; no token or session was available. "
+                "Automatic login failed or could not run for all eligible candidates; "
+                "no token or session was available. "
                 + "; ".join(attempt_details)
             )
         raise LoginError(reason, status_code=last_status)
@@ -1557,11 +1557,6 @@ class AuthenticationTest:
         method = str(selected_endpoint.get("method") or "GET").upper()
         selection_reason = selected_endpoint["reason"]
         candidate_endpoint = selected_endpoint.get("endpoint")
-        if method != "GET":
-            return self.skipped_result(
-                {"method": method, "path": protected_path},
-                "Only discovered GET endpoints are eligible for JWT probes.",
-            )
         try:
             url = self._scope_url(target, protected_path)
         except (LoginConfigurationError, ValueError) as exc:
@@ -1695,9 +1690,8 @@ class AuthenticationTest:
             else:
                 logger.info(
                     "Login executor ready | candidates=%d | "
-                    "request_limit=%d",
+                    "attempting_all_candidates",
                     len(discovered_login_candidates),
-                    Signin.MAX_LOGIN_CANDIDATES,
                 )
                 token_info = self._signin_candidates(
                     target,

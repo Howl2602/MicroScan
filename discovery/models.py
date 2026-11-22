@@ -5,9 +5,10 @@ class Discovery:
     def discover(
         self,
         target: str,
-        num: int = 10000,
+        num: int = 200,
         return_outcome=False,
         timeout_seconds=None,
+        wordlist=None,
     ):
         scanner = KiteRunner()
         return scanner.kiterunner_scan(
@@ -15,6 +16,7 @@ class Discovery:
             num,
             return_outcome=return_outcome,
             timeout_seconds=timeout_seconds,
+            wordlist=wordlist,
         )
 
     def discover_seeded(

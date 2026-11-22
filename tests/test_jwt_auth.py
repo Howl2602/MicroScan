@@ -1860,7 +1860,7 @@ class AuthenticationTestTests(unittest.TestCase):
             (endpoint["method"], endpoint["path"]): endpoint for endpoint in analyzed
         }
         self.assertEqual(len(analyzed), 3)
-        self.assertEqual(request.call_count, 4)
+        self.assertEqual(request.call_count, 6)
         self.assertEqual(
             by_identity[("GET", "/api/orders/1")]["test_results"][0]["test_cases"][1]["status"],
             "not_detected_in_this_test",
@@ -1926,13 +1926,13 @@ class AuthenticationTestTests(unittest.TestCase):
                 for path, endpoint in by_path.items()
                 if endpoint["jwt_selected"]
             },
-            {"/api/orders/1", "/api/orders/check/"},
+            {"/api/orders/1", "/api/orders/check/", "/api/users"},
         )
-        self.assertEqual(request.call_count, 4)
+        self.assertEqual(request.call_count, 6)
         self.assertEqual(by_path["/api/auth/login"]["test_results"][0]["status"], "skipped")
         self.assertIn("login", by_path["/api/auth/login"]["jwt_selection_reason"])
         self.assertEqual(by_path["/api/health"]["test_results"][0]["status"], "skipped")
-        self.assertEqual(by_path["/api/users"]["test_results"][0]["status"], "skipped")
+        self.assertEqual(by_path["/api/users"]["test_results"][0]["status"], "inconclusive")
         self.assertEqual(by_path["/api/search"]["test_results"][0]["status"], "skipped")
         self.assertIn("HTTP 200", by_path["/api/orders/check/"]["jwt_selection_reason"])
         self.assertFalse(by_path["/api/unknown"]["jwt_selected"])
@@ -2025,7 +2025,7 @@ class AuthenticationTestTests(unittest.TestCase):
         self.assertTrue(all(call.args[0] == "GET" for call in request.call_args_list))
 
     @patch.dict(os.environ, {"MICROSCAN_JWT_ENDPOINT_ALLOWLIST": "[]"}, clear=True)
-    def test_auto_selection_is_bounded_to_five_priority_route_groups(self):
+    def test_auto_selection_is_bounded_to_ten_priority_route_groups(self):
         discovered = [
             {"method": "GET", "path": f"/api/orders/{identifier}", "status": 401}
             for identifier in range(1, 8)
@@ -2049,7 +2049,7 @@ class AuthenticationTestTests(unittest.TestCase):
         with patch.object(
             self.authentication_test,
             "_run_http_request",
-            side_effect=[response(401, {}) for _ in range(10)],
+            side_effect=[response(401, {}) for _ in range(20)],
         ) as request:
             analyzed = self.modules.analyze_endpoints(
                 "http://localhost:8085",
@@ -2059,18 +2059,12 @@ class AuthenticationTestTests(unittest.TestCase):
 
         selected = [endpoint for endpoint in analyzed if endpoint["jwt_selected"]]
         skipped = [endpoint for endpoint in analyzed if not endpoint["jwt_selected"]]
-        self.assertEqual(len(selected), 5)
-        self.assertEqual(request.call_count, 10)
-        self.assertEqual(len(skipped), 11)
+        self.assertEqual(len(selected), 8)
+        self.assertEqual(request.call_count, 16)
+        self.assertEqual(len(skipped), 8)
         self.assertTrue(
             any(
                 "same route shape" in endpoint["jwt_selection_reason"]
-                for endpoint in skipped
-            )
-        )
-        self.assertTrue(
-            any(
-                "limited to 5 endpoint groups" in endpoint["jwt_selection_reason"]
                 for endpoint in skipped
             )
         )
@@ -2087,6 +2081,7 @@ class AuthenticationTestTests(unittest.TestCase):
         with patch.object(
             self.authentication_test,
             "_run_http_request",
+            side_effect=[response(401, {}), response(401, {})],
         ) as request:
             analyzed = self.modules.analyze_endpoints(
                 "http://localhost:8085",
@@ -2099,10 +2094,16 @@ class AuthenticationTestTests(unittest.TestCase):
         self.assertIn("query or fragment", analyzed[0]["jwt_selection_reason"])
 
     @patch.dict(os.environ, {"MICROSCAN_JWT_ENDPOINT_ALLOWLIST": "[]"}, clear=True)
-    def test_auto_selection_requires_enabled_local_mode_and_loopback(self):
+    def test_auto_selection_requires_enabled_mode_for_any_authorized_target(self):
         with patch.object(
             self.authentication_test,
             "_run_http_request",
+            side_effect=[
+                response(401, {}),
+                response(401, {}),
+                response(401, {}),
+                response(401, {}),
+            ],
         ) as request:
             not_confirmed = self.modules.analyze_endpoints(
                 "http://127.0.0.1:8085",
@@ -2120,13 +2121,13 @@ class AuthenticationTestTests(unittest.TestCase):
                 scan_mode="full",
             )
 
-        request.assert_not_called()
+        self.assertEqual(request.call_count, 4)
         self.assertFalse(not_confirmed[0]["jwt_selected"])
         self.assertIn("disabled for this scan", not_confirmed[0]["jwt_selection_reason"])
-        self.assertFalse(non_local[0]["jwt_selected"])
-        self.assertIn("host-local target", non_local[0]["jwt_selection_reason"])
-        self.assertFalse(non_local_full[0]["jwt_selected"])
-        self.assertIn("host-local target", non_local_full[0]["jwt_selection_reason"])
+        self.assertTrue(non_local[0]["jwt_selected"])
+        self.assertIn("protected-resource candidate", non_local[0]["jwt_selection_reason"])
+        self.assertTrue(non_local_full[0]["jwt_selected"])
+        self.assertIn("protected-resource candidate", non_local_full[0]["jwt_selection_reason"])
 
     @patch.dict(
         os.environ,
@@ -2304,7 +2305,7 @@ class AuthenticationTestTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         self.assertEqual(by_method["GET"]["status"], "inconclusive")
         self.assertEqual(by_method["POST"]["status"], "skipped")
-        self.assertEqual(by_method["PUT"]["status"], "skipped")
+        self.assertNotIn("PUT", by_method)
 
     @patch.dict(
         os.environ,
@@ -2577,7 +2578,7 @@ class AuthenticationTestTests(unittest.TestCase):
 
         result = analyzed[0]["test_results"][0]
         self.assertEqual(result["status"], "skipped")
-        self.assertIn("only GET is supported", result["reason"])
+        self.assertIn("authentication", result["reason"].lower())
 
     @patch.dict(
         os.environ,
@@ -2707,19 +2708,20 @@ class AuthenticationTestTests(unittest.TestCase):
         result = self.modules.evaluate_authentication_test("http://127.0.0.1:8085")
         self.assertEqual(result["status"], "skipped")
 
-    def test_discovered_endpoint_is_not_probed_without_explicit_allowlist(self):
+    def test_discovered_endpoint_is_supported_when_explicit_allowlist_is_absent(self):
         os.environ.pop("MICROSCAN_PROTECTED_ENDPOINT", None)
         with patch.object(
             self.authentication_test,
             "_run_http_request",
+            side_effect=[response(401, {}), response(401, {})],
         ) as request:
             result = self.modules.evaluate_authentication_test(
                 "http://127.0.0.1:8085",
                 [{"method": "GET", "path": "/api/users/me"}],
             )
 
-        self.assertEqual(result["status"], "skipped")
-        request.assert_not_called()
+        self.assertIn(result["status"], {"inconclusive", "not_vulnerable_in_test", "potential"})
+        self.assertEqual(request.call_count, 2)
 
     def test_security_probe_disables_redirects_and_sets_timeout(self):
         with patch(

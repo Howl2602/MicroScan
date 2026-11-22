@@ -1,3 +1,9 @@
+import {
+  localizeReportFinding,
+  localizeReportPriority,
+  localizeReportText,
+} from './reportLocalization.js'
+
 const sensitiveKeyPattern =
   /(^|_)(password|passwd|secret|credential|credentials|api_key|private_key|access_token|refresh_token|id_token|cookie|set_cookie|authorization|bearer_token|session_token|token)(_|$)/i
 
@@ -91,7 +97,7 @@ function renderGatewayBypass(report = {}) {
     const endpointRows = endpoints.length
       ? `<table><thead><tr><th>Service origin</th><th>Endpoint</th><th>Result</th><th>Reason</th><th>Gateway evidence</th><th>Direct-service evidence</th><th>Comparison</th></tr></thead><tbody>${endpoints
         .map(({ service, endpoint }) =>
-          `<tr><td>${escapeHtml(service.origin ?? 'Not reported')}<br>Port ${escapeHtml(service.port ?? '—')}</td><td>${escapeHtml(endpoint.method ?? 'GET')} ${escapeHtml(endpoint.path ?? '/')}</td><td>${escapeHtml(endpoint.status ?? 'inconclusive')}</td><td>${escapeHtml(endpoint.reason ?? 'No reason reported.')}</td><td><pre>${formatValue(endpoint.gateway ?? {})}</pre></td><td><pre>${formatValue(endpoint.direct ?? {})}</pre></td><td><pre>${formatValue(endpoint.comparison ?? {})}</pre></td></tr>`,
+          `<tr><td>${escapeHtml(service.origin ?? 'Not reported')}<br>Port ${escapeHtml(service.port ?? '-')}</td><td>${escapeHtml(endpoint.method ?? 'GET')} ${escapeHtml(endpoint.path ?? '/')}</td><td>${escapeHtml(endpoint.status ?? 'inconclusive')}</td><td>${escapeHtml(endpoint.reason ?? 'No reason reported.')}</td><td><pre>${formatValue(endpoint.gateway ?? {})}</pre></td><td><pre>${formatValue(endpoint.direct ?? {})}</pre></td><td><pre>${formatValue(endpoint.comparison ?? {})}</pre></td></tr>`,
         )
         .join('')}</tbody></table>`
       : '<p>No Gateway/direct endpoint comparisons were reported.</p>'
@@ -99,12 +105,12 @@ function renderGatewayBypass(report = {}) {
       ? `<table><thead><tr><th>Service origin</th><th>Port</th><th>Verification</th></tr></thead><tbody>${services
         .map(
           (service) =>
-            `<tr><td>${escapeHtml(service.origin ?? 'Not reported')}</td><td>${escapeHtml(service.port ?? '—')}</td><td><pre>${formatValue(service.verification_evidence ?? service.verification_status ?? {})}</pre></td></tr>`,
+            `<tr><td>${escapeHtml(service.origin ?? 'Not reported')}</td><td>${escapeHtml(service.port ?? '-')}</td><td><pre>${formatValue(service.verification_evidence ?? service.verification_status ?? {})}</pre></td></tr>`,
         )
         .join('')}</tbody></table>`
       : '<p>No verified service origins were reported.</p>'
 
-    return `<section><h2>Gateway Bypass</h2><p>Status: ${escapeHtml(report.status ?? 'not reported')}${report.reason ? ` — ${escapeHtml(report.reason)}` : ''}</p><p>Ports scanned: ${escapeHtml(report.ports_scanned ?? '—')}; open candidates: ${escapeHtml(report.open_ports_found ?? '—')}; endpoint comparisons: ${endpoints.length}.</p><h3>Gateway origins</h3>${renderRecords(report.gateway_origins, 'No Gateway origins were recorded from Discovery.')}<h3>Verified service origins</h3>${serviceRows}<h3>Gateway and direct-service comparisons</h3>${endpointRows}<h3>Excluded service-origin candidates</h3>${renderRecords(report.excluded_service_origins, 'No service-origin candidates were excluded.')}<h3>Skipped endpoints</h3>${renderRecords(report.skipped_endpoints, 'No discovered endpoints were skipped.')}</section>`
+    return `<section><h2>Gateway Bypass</h2><p>Status: ${escapeHtml(report.status ?? 'not reported')}${report.reason ? ` - ${escapeHtml(report.reason)}` : ''}</p><p>Ports scanned: ${escapeHtml(report.ports_scanned ?? '-')}; open candidates: ${escapeHtml(report.open_ports_found ?? '-')}; endpoint comparisons: ${endpoints.length}.</p><h3>Gateway origins</h3>${renderRecords(report.gateway_origins, 'No Gateway origins were recorded from Discovery.')}<h3>Verified service origins</h3>${serviceRows}<h3>Gateway and direct-service comparisons</h3>${endpointRows}<h3>Excluded service-origin candidates</h3>${renderRecords(report.excluded_service_origins, 'No service-origin candidates were excluded.')}<h3>Skipped endpoints</h3>${renderRecords(report.skipped_endpoints, 'No discovered endpoints were skipped.')}</section>`
 }
 
 function renderRemediations(findings) {
@@ -116,17 +122,21 @@ function renderRemediations(findings) {
   }
   return withGuidance.map((finding) => {
     const remediation = finding.remediation
+    const recommendation = finding.recommendation
     const renderList = (items) => (
       Array.isArray(items) && items.length
-        ? `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
-        : '<p>Not reported.</p>'
+        ? `<ul>${items.map((item) => `<li>${escapeHtml(localizeReportText(item))}</li>`).join('')}</ul>`
+        : '<p>Chưa có thông tin.</p>'
     )
-    return `<article><h3>${escapeHtml(finding.name ?? 'Finding')} — ${escapeHtml(finding.method ?? '')} ${escapeHtml(finding.endpoint ?? '')}</h3><p><strong>Possible cause:</strong> ${escapeHtml(remediation.root_cause ?? 'Not reported.')}</p><p><strong>Suggested actions:</strong></p>${renderList(remediation.actions)}<p><strong>Retest checklist:</strong></p>${renderList(remediation.retest_steps)}<p><strong>Suggested priority:</strong> ${escapeHtml(remediation.suggested_priority ?? 'review')}</p><p><strong>Limitations:</strong> ${escapeHtml(remediation.limitation ?? 'Review recommendations against the application.')}</p><p>${escapeHtml(remediation.note ?? 'Offline, rule-based guidance; validate before applying.')}</p></article>`
+    return `<article><h3>${escapeHtml(localizeReportText(finding.name ?? 'Phát hiện'))} - ${escapeHtml(finding.method ?? '')} ${escapeHtml(finding.endpoint ?? '')}</h3>${recommendation ? `<p><strong>Khuyến nghị:</strong> ${escapeHtml(localizeReportText(recommendation))}</p>` : ''}<p><strong>Nguyên nhân có thể:</strong> ${escapeHtml(localizeReportText(remediation.root_cause ?? 'Chưa có thông tin.'))}</p><p><strong>Hành động đề xuất:</strong></p>${renderList(remediation.actions)}<p><strong>Danh sách kiểm thử lại:</strong></p>${renderList(remediation.retest_steps)}<p><strong>Mức ưu tiên đề xuất:</strong> ${escapeHtml(localizeReportPriority(remediation.suggested_priority))}</p><p><strong>Giới hạn:</strong> ${escapeHtml(localizeReportText(remediation.limitation ?? 'Hãy đối chiếu khuyến nghị với ứng dụng.'))}</p><p>${escapeHtml(localizeReportText(remediation.note ?? 'Offline, rule-based guidance; validate before applying.'))}</p></article>`
   }).join('')
 }
 
 export function createReportHtml(report) {
   const safe = sanitizeReportData(report)
+  const findings = Array.isArray(safe.findings)
+    ? safe.findings.map(localizeReportFinding)
+    : safe.findings
   const target = safe.target || 'Not reported'
   return `<!doctype html>
 <html lang="vi">
@@ -162,8 +172,8 @@ export function createReportHtml(report) {
   </header>
   <main>
     <section><h2>Overview and scan profile</h2>${renderSummary(safe.summary)}</section>
-    <section><h2>Findings, status, severity, confidence, and evidence</h2>${renderRecords(safe.findings, 'No findings were reported.')}</section>
-    <section><h2>Offline remediation guidance</h2>${renderRemediations(safe.findings)}</section>
+    <section><h2>Findings, status, severity, confidence, and evidence</h2>${renderRecords(findings, 'No findings were reported.')}</section>
+    <section><h2>Khuyến nghị khắc phục</h2>${renderRemediations(findings)}</section>
     <section><h2>Discovery stages and diagnostics</h2>${renderRecords(safe.scanStages, 'No scan stages were reported.')}${safe.fileDiscoveryError ? `<p><strong>File Discovery error:</strong> ${escapeHtml(safe.fileDiscoveryError)}</p>` : ''}</section>
     <section><h2>Discovery inventory and evidence</h2>${renderRecords(safe.discoveryResults, 'No discovery records were reported.')}</section>
     <section><h2>Endpoint test cases and evidence</h2>${renderRecords(safe.endpointAssessments, 'No endpoint assessments were reported.')}</section>

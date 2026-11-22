@@ -14,7 +14,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.logging_config import logger
-from discovery.file_discovery import DEFAULT_WORDLIST, FileDiscovery, normalize_origin
+from discovery.file_discovery import (
+    DEFAULT_WORDLIST,
+    DEFAULT_WORDLIST_FILE,
+    DEFAULT_WORDLIST_LIMIT,
+    MAX_WORDLIST_ENTRIES,
+    FileDiscovery,
+    available_wordlists,
+    load_wordlist_file,
+    normalize_origin,
+    wordlist_path_count,
+)
 from discovery.models import Discovery
 from module.gateway_bypass import GatewayBypass
 from module.modules import Modules
@@ -39,6 +49,8 @@ DISCOVERY_LIMITS = RecursiveDiscoveryLimits()
 class FileDiscoveryRequest(BaseModel):
     target: str = Field(max_length=2048)
     wordlist: str | None = Field(default=None, max_length=20000)
+    wordlist_name: str | None = Field(default=None, max_length=255)
+    wordlist_limit: int = Field(default=DEFAULT_WORDLIST_LIMIT, ge=1, le=MAX_WORDLIST_ENTRIES)
     requests_per_second: float = Field(default=2, ge=0.5, le=5)
     timeout: float = Field(default=5, ge=1, le=15)
     concurrency: int = Field(default=2, ge=1, le=5)
@@ -748,10 +760,10 @@ def _jwt_inventory_candidates(
         reason = None
         if record.get("template") or record.get("is_template"):
             reason = "Unresolved dynamic template cannot be sent as a literal request."
-        elif method not in {"GET"}:
+        elif method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
             reason = (
                 f"Unsupported or unknown discovery method {method or 'UNKNOWN'}; "
-                "JWT probes currently support GET only."
+                "JWT probes support GET, POST, PUT, PATCH, DELETE, HEAD, and OPTIONS."
             )
         elif not isinstance(candidate_url, str) or not candidate_url:
             reason = "No resolved endpoint URL is available."
@@ -1602,6 +1614,13 @@ async def _run_scan_pipeline(
     jwt_testing=True,
     bola_testing=True,
     gateway_bypass_testing=True,
+    wordlist_name=None,
+    wordlist_limit=DEFAULT_WORDLIST_LIMIT,
+    kiterunner_wordlist=None,
+    jwt_allowlist=None,
+    jwt_endpoint_budget=None,
+    bola_request_budget=None,
+    rate_limit_request_budget=None,
 ):
     if scan_mode not in {"standard", "full"}:
         raise ValueError("scan_mode must be either 'standard' or 'full'.")
@@ -1656,13 +1675,28 @@ async def _run_scan_pipeline(
     kiterunner_results = []
     kiterunner_error = None
     try:
-        kiterunner_results = await asyncio.to_thread(
-            Discovery().discover, discovery_target, num
-        )
+        if kiterunner_wordlist is None:
+            kiterunner_results = await asyncio.to_thread(
+                Discovery().discover, discovery_target, num
+            )
+        else:
+            kiterunner_results = await asyncio.to_thread(
+                Discovery().discover,
+                discovery_target,
+                num,
+                wordlist=kiterunner_wordlist,
+            )
         await emit(
             "API Discovery",
             "completed",
-            f"Kiterunner discovered {len(kiterunner_results)} endpoint(s).",
+            (
+                f"Kiterunner discovered {len(kiterunner_results)} endpoint(s)"
+                + (
+                    f" using {wordlist_name} (up to {num} entries)."
+                    if kiterunner_wordlist is not None
+                    else "."
+                )
+            ),
         )
     except (ValueError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
         kiterunner_error = str(exc)
@@ -1683,12 +1717,24 @@ async def _run_scan_pipeline(
     file_result = {"results": [], "summary": {}}
     file_error = None
     try:
+        selected_wordlist = None
+        wordlist_truncated = False
+        if wordlist_name:
+            selected_wordlist, wordlist_truncated = load_wordlist_file(
+                wordlist_name, wordlist_limit
+            )
         file_result = await FileDiscovery().scan(
             normalized_target,
+            wordlist=selected_wordlist,
             verify_endpoints=bool(file_verification_target),
             gateway_target=file_verification_target,
             progress_callback=emit,
+            wordlist_limit=wordlist_limit,
         )
+        if wordlist_truncated:
+            file_result.setdefault("summary", {})["wordlist_truncated"] = True
+        if wordlist_name:
+            file_result.setdefault("summary", {})["wordlist_name"] = wordlist_name
         request_count = file_result.get("summary", {}).get("requests_made", 0)
         failed_count = file_result.get("summary", {}).get("requests_failed", 0)
         if request_count and failed_count >= request_count:
@@ -1773,13 +1819,23 @@ async def _run_scan_pipeline(
         )
         origin_results = []
         try:
-            origin_outcome = await asyncio.to_thread(
-                Discovery().discover,
-                origin,
-                num,
-                True,
-                limits.command_timeout_seconds,
-            )
+            if kiterunner_wordlist is None or not Signin.is_loopback_target(origin):
+                origin_outcome = await asyncio.to_thread(
+                    Discovery().discover,
+                    origin,
+                    num,
+                    True,
+                    limits.command_timeout_seconds,
+                )
+            else:
+                origin_outcome = await asyncio.to_thread(
+                    Discovery().discover,
+                    origin,
+                    num,
+                    True,
+                    limits.command_timeout_seconds,
+                    wordlist=kiterunner_wordlist,
+                )
             if isinstance(origin_outcome, dict):
                 origin_results = origin_outcome.get("results", [])
                 origin_target = origin_outcome.get("target", origin)
@@ -2402,6 +2458,7 @@ async def _run_scan_pipeline(
             scan_failed=True,
             failure_reason="All discovery stages failed before evidence collection.",
             scan_mode=scan_mode,
+            rate_limit_request_budget=rate_limit_request_budget,
         )
         report["summary"]["enabled_modules"] = enabled_modules
         _set_security_dispositions(
@@ -2478,6 +2535,10 @@ async def _run_scan_pipeline(
             rate_limit_testing=rate_limit_testing,
             jwt_testing=jwt_testing,
             bola_testing=bola_testing,
+            jwt_allowlist=jwt_allowlist,
+            jwt_endpoint_budget=jwt_endpoint_budget,
+            bola_request_budget=bola_request_budget,
+            rate_limit_request_budget=rate_limit_request_budget,
         )
         if security_progress_futures:
             await asyncio.gather(
@@ -2495,6 +2556,7 @@ async def _run_scan_pipeline(
             scan_failed=True,
             failure_reason="Security testing failed after discovery.",
             scan_mode=scan_mode,
+            rate_limit_request_budget=rate_limit_request_budget,
         )
         report["summary"]["enabled_modules"] = enabled_modules
         _set_security_dispositions(
@@ -2546,7 +2608,11 @@ async def _run_scan_pipeline(
                 "verification_status", "discovered"
             )
             endpoint["discovery_evidence"] = correlated.get("discovery_evidence", [])
-    report = build_pentest_report(analyzed, scan_mode=scan_mode)
+    report = build_pentest_report(
+        analyzed,
+        scan_mode=scan_mode,
+        rate_limit_request_budget=rate_limit_request_budget,
+    )
     selected_count = sum(1 for endpoint in analyzed if endpoint.get("jwt_selected"))
     tested_count = report["summary"]["tested_endpoints"]
     request_count = report["summary"]["request_count"]
@@ -2605,6 +2671,7 @@ async def _run_scan_pipeline(
         analyzed,
         scan_mode=scan_mode,
         gateway_bypass=gateway_bypass,
+        rate_limit_request_budget=rate_limit_request_budget,
     )
     report["summary"]["enabled_modules"] = enabled_modules
     _set_security_dispositions(
@@ -2795,6 +2862,9 @@ async def _run_scan_pipeline(
                 for item in jwt_inventory_exclusions
             ),
             "jwt_zero_request_reason": zero_request_reason,
+            "jwt_allowlist_configured": bool(jwt_allowlist),
+            "jwt_allowlist_entries": len(jwt_allowlist or []),
+            "jwt_allowlist_targets": jwt_allowlist or [],
             "selected_endpoints": sum(1 for endpoint in analyzed if endpoint.get("jwt_selected")),
             "selected_for_testing_endpoints": sum(
                 1 for endpoint in analyzed if endpoint.get("jwt_selected")
@@ -2932,19 +3002,46 @@ def default_file_discovery_wordlist():
     return {"name": "MicroScan default", "wordlist": DEFAULT_WORDLIST}
 
 
+@app.get("/file-discovery/wordlists")
+def file_discovery_wordlists():
+    return {
+        "default": DEFAULT_WORDLIST_FILE,
+        "wordlists": available_wordlists(),
+    }
+
+
 @app.post("/file-discovery")
 async def file_discovery(request: FileDiscoveryRequest):
     try:
-        return await FileDiscovery().scan(
+        if request.wordlist_name and request.wordlist is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Specify either wordlist_name or custom wordlist, not both.",
+            )
+        selected_wordlist = request.wordlist
+        wordlist_truncated = False
+        if request.wordlist_name:
+            selected_wordlist, wordlist_truncated = load_wordlist_file(
+                request.wordlist_name, request.wordlist_limit
+            )
+        result = await FileDiscovery().scan(
             target=request.target,
-            wordlist=request.wordlist,
+            wordlist=selected_wordlist,
             requests_per_second=request.requests_per_second,
             timeout=request.timeout,
             concurrency=request.concurrency,
             analyze_javascript=request.analyze_javascript,
             verify_endpoints=request.verify_endpoints,
             gateway_target=request.gateway_target,
+            wordlist_limit=request.wordlist_limit,
         )
+        if wordlist_truncated:
+            result.setdefault("summary", {})["wordlist_truncated"] = True
+        if request.wordlist_name:
+            result.setdefault("summary", {})["wordlist_name"] = request.wordlist_name
+        return result
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2953,7 +3050,12 @@ async def file_discovery(request: FileDiscoveryRequest):
 async def scan(
     request: Request,
     target: str,
-    num: int = 1000,
+    num: int = 200,
+    kiterunner_limit: int | None = Query(default=None, ge=1, le=500000),
+    wordlist_name: str | None = Query(default=None, max_length=255),
+    wordlist_limit: int = Query(
+        default=DEFAULT_WORDLIST_LIMIT, ge=1, le=MAX_WORDLIST_ENTRIES
+    ),
     auto_jwt_local_lab: bool = False,
     scan_mode: str = "standard",
     stream: bool = False,
@@ -2964,7 +3066,28 @@ async def scan(
     jwt_testing: bool = True,
     bola_testing: bool = True,
     gateway_bypass_testing: bool = True,
+    jwt_allowlist: str | None = Query(default=None, max_length=10000),
+    jwt_endpoint_budget: int = Query(default=5, ge=1, le=100),
+    bola_request_budget: int = Query(default=10, ge=1, le=100),
+    rate_limit_request_budget: int = Query(default=100, ge=1, le=1000),
 ):
+    kiterunner_wordlist = None
+    parsed_jwt_allowlist = None
+    if jwt_allowlist:
+        try:
+            parsed_jwt_allowlist = json.loads(jwt_allowlist)
+            if not isinstance(parsed_jwt_allowlist, list):
+                raise ValueError("jwt_allowlist must be a JSON list.")
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if kiterunner_limit is not None:
+        num = kiterunner_limit
+        if wordlist_name:
+            try:
+                num = min(num, wordlist_path_count(wordlist_name))
+                kiterunner_wordlist, _ = load_wordlist_file(wordlist_name, num)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not stream:
         try:
             status, payload = await _run_scan_pipeline(
@@ -2979,6 +3102,13 @@ async def scan(
                 jwt_testing=jwt_testing,
                 bola_testing=bola_testing,
                 gateway_bypass_testing=gateway_bypass_testing,
+                wordlist_name=wordlist_name,
+                wordlist_limit=wordlist_limit,
+                kiterunner_wordlist=kiterunner_wordlist,
+                jwt_allowlist=parsed_jwt_allowlist,
+                jwt_endpoint_budget=jwt_endpoint_budget,
+                bola_request_budget=bola_request_budget,
+                rate_limit_request_budget=rate_limit_request_budget,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3007,6 +3137,13 @@ async def scan(
                     jwt_testing,
                     bola_testing,
                     gateway_bypass_testing,
+                    wordlist_name,
+                    wordlist_limit,
+                    kiterunner_wordlist,
+                    parsed_jwt_allowlist,
+                    jwt_endpoint_budget,
+                    bola_request_budget,
+                    rate_limit_request_budget,
                 )
                 await queue.put(
                     {"type": "complete", "status_code": status, "payload": payload}

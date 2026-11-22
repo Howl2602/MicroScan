@@ -1,4 +1,4 @@
-import { Component, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   buildApiTree,
   filterDiscoveryResults,
@@ -6,6 +6,7 @@ import {
   getUnscannedOrigins,
 } from './apiMap.js'
 import { downloadReport } from './reportExport.js'
+import { localizeReportPriority, localizeReportText } from './reportLocalization.js'
 import IntroductionPage from './IntroductionPage.jsx'
 
 import {
@@ -39,11 +40,52 @@ import {
 
 const drawerWidth = 240
 const apiBaseUrl = '/api'
+const defaultWordlistFile = 'httparchive_apiroutes_2026_02_27.txt'
+const legacyDefaultWordlistFile = 'api_wordlist.txt'
+
+function getStoredNumber(key, fallback, min, max) {
+  if (typeof window === 'undefined') return fallback
+  const value = Number(window.localStorage.getItem(key))
+  return Number.isInteger(value) && value >= min && value <= max ? value : fallback
+}
+
+function getStoredKiterunnerLimit() {
+  if (typeof window === 'undefined') return 200
+  const currentKey = 'microscan-kiterunner-limit-v3'
+  const legacyKey = 'microscan-kiterunner-limit-v2'
+  const current = window.localStorage.getItem(currentKey)
+  if (current !== null) {
+    const value = Number(current)
+    return Number.isInteger(value) && value >= 1 && value <= 500000 ? value : 200
+  }
+
+  const legacy = window.localStorage.getItem(legacyKey)
+  const value = Number(legacy)
+  if (!Number.isInteger(value) || value < 1 || value > 500000 || value === 5000) {
+    return 200
+  }
+  return value
+}
+
+function getStoredWordlist() {
+  if (typeof window === 'undefined') return defaultWordlistFile
+  const stored = window.localStorage.getItem('microscan-wordlist')
+  return !stored || stored === legacyDefaultWordlistFile
+    ? defaultWordlistFile
+    : stored
+}
 
 export function SidebarNavigation({ activePage, onNavigate }) {
   return (
     <List sx={{ px: 1 }}>
-      {['Dashboard', 'Scan', 'API Map', 'Reports', 'Settings', 'Introduction'].map((page) => (
+      {[
+        ['Dashboard', 'Dashboard'],
+        ['Scan', 'Scan'],
+        ['API Map', 'API Map'],
+        ['Reports', 'Reports'],
+        ['Settings', 'Settings'],
+        ['Introduction', 'Introduction'],
+      ].map(([page, label]) => (
         <ListItem key={page} disablePadding>
           <ListItemButton
             selected={activePage === page}
@@ -65,7 +107,7 @@ export function SidebarNavigation({ activePage, onNavigate }) {
                 <span aria-hidden="true">ⓘ</span>
               </ListItemIcon>
             )}
-            <ListItemText primary={page} />
+            <ListItemText primary={label} />
           </ListItemButton>
         </ListItem>
       ))}
@@ -342,7 +384,7 @@ function DiscoveryProgress({ stages, loading }) {
           </Box>
         )
       })}
-      {loading && <CircularProgress size={18} aria-label="Scan in progress" />}
+      {loading && <CircularProgress size={18} aria-label="Đang quét" />}
     </Box>
   )
 }
@@ -353,13 +395,13 @@ function DiscoveryResultsTable({ results }) {
       <Table size="small">
         <TableHead>
           <TableRow>
-            <TableCell>Path / URL</TableCell>
-            <TableCell>Method</TableCell>
+            <TableCell>Đường dẫn / URL</TableCell>
+            <TableCell>Phương thức</TableCell>
             <TableCell>Origin</TableCell>
-            <TableCell>Status</TableCell>
-            <TableCell>Source</TableCell>
-            <TableCell>Verification</TableCell>
-            <TableCell>Evidence / observations</TableCell>
+            <TableCell>Trạng thái</TableCell>
+            <TableCell>Nguồn</TableCell>
+            <TableCell>Xác minh</TableCell>
+            <TableCell>Bằng chứng / quan sát</TableCell>
           </TableRow>
         </TableHead>
         <TableBody>
@@ -368,7 +410,7 @@ function DiscoveryResultsTable({ results }) {
           ) : results.map((item, index) => (
             <TableRow key={`${item.method}-${item.url}-${index}`}>
               <TableCell sx={{ maxWidth: 360, overflowWrap: 'anywhere' }}>
-                {item.discovered_path ?? item.url ?? item.template ?? '—'}
+                {item.discovered_path ?? item.url ?? item.template ?? '-'}
                 {item.resolved_url && item.resolved_url !== item.url && (
                   <Typography display="block" variant="caption" color="text.secondary">
                     Resolved: {item.resolved_url}
@@ -389,7 +431,7 @@ function DiscoveryResultsTable({ results }) {
                   }
                 })()}
               </TableCell>
-              <TableCell>{item.status_code ?? '—'}</TableCell>
+              <TableCell>{item.status_code ?? '-'}</TableCell>
               <TableCell>{(Array.isArray(item.sources) ? item.sources : [])
                 .filter((source) => typeof source === 'string')
                 .map((source) => <Chip key={source} label={source} size="small" sx={{ mr: 0.5, mb: 0.5 }} />)}</TableCell>
@@ -440,7 +482,7 @@ function DiscoveryResultsTable({ results }) {
                       ) : null
                     ))}
                   </Box>
-                ) : '—'}
+                ) : '-'}
               </TableCell>
             </TableRow>
           ))}
@@ -453,18 +495,18 @@ function DiscoveryResultsTable({ results }) {
 function DiscoveryCategoryFilter({ id, value, onChange }) {
   return (
     <FormControl size="small" sx={{ minWidth: 190 }}>
-      <InputLabel id={`${id}-label`}>Endpoint category</InputLabel>
+      <InputLabel id={`${id}-label`}>Nhóm endpoint</InputLabel>
       <Select
         labelId={`${id}-label`}
         value={value}
-        label="Endpoint category"
+        label="Nhóm endpoint"
         onChange={(event) => onChange(event.target.value)}
       >
-        <MenuItem value="all">All</MenuItem>
+        <MenuItem value="all">Tất cả</MenuItem>
         <MenuItem value="actionable">Actionable</MenuItem>
         <MenuItem value="not_found">Not Found</MenuItem>
-        <MenuItem value="blocked">Blocked</MenuItem>
-        <MenuItem value="inconclusive">Inconclusive</MenuItem>
+        <MenuItem value="blocked">Bị chặn</MenuItem>
+        <MenuItem value="inconclusive">Chưa kết luận</MenuItem>
       </Select>
     </FormControl>
   )
@@ -529,7 +571,7 @@ function EndpointAssessments({ assessments, findings = [] }) {
               <TableCell>Case</TableCell>
               <TableCell>HTTP status</TableCell>
               <TableCell>Result</TableCell>
-              <TableCell>Evidence</TableCell>
+              <TableCell>Bằng chứng</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
@@ -541,7 +583,7 @@ function EndpointAssessments({ assessments, findings = [] }) {
                     {testCase.request_condition}
                   </Typography>
                 </TableCell>
-                <TableCell>{testCase.evidence?.status_code ?? '—'}</TableCell>
+                <TableCell>{testCase.evidence?.status_code ?? '-'}</TableCell>
                 <TableCell>
                   {testCase.status === 'not_vulnerable_in_test' ||
                   testCase.status === 'not_detected_in_this_test'
@@ -590,7 +632,7 @@ function EndpointAssessments({ assessments, findings = [] }) {
                       </Box>
                     </Box>
                   ) : (
-                    '—'
+                    '-'
                   )}
                 </TableCell>
               </TableRow>
@@ -624,10 +666,10 @@ function RateLimitResults({ assessments, summary }) {
           <TableHead>
             <TableRow>
               <TableCell>Endpoint</TableCell>
-              <TableCell>Assessment</TableCell>
-              <TableCell>Requests / HTTP statuses</TableCell>
-              <TableCell>Rate-limit headers</TableCell>
-              <TableCell>Reason</TableCell>
+              <TableCell>Đánh giá</TableCell>
+              <TableCell>Request / mã HTTP</TableCell>
+              <TableCell>Header giới hạn tốc độ</TableCell>
+              <TableCell>Lý do</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
@@ -682,7 +724,7 @@ function BolaCorrelationResults({ assessments, baselines, activeTests, summary }
       </Typography>
       {summary?.jwt_selection_budgets?.map((budget, index) => (
         <Typography key={`jwt-budget-${index}`} color="text.secondary" variant="body2">
-          JWT selection budget ({budget.mode ?? 'unknown'}): {budget.used ?? '—'} of {budget.configured ?? 'not applicable'} group(s) used
+          JWT selection budget ({budget.mode ?? 'unknown'}): {budget.used ?? '-'} of {budget.configured ?? 'not applicable'} group(s) used
           {budget.remaining != null ? ` · ${budget.remaining} remaining` : ''}
         </Typography>
       ))}
@@ -757,7 +799,7 @@ function BolaCorrelationResults({ assessments, baselines, activeTests, summary }
                 ? ` · ${assessment.response_diagnostic.skip_reason}`
                 : ''}
               {assessment.response_diagnostic.selection_reason
-                ? ` — ${assessment.response_diagnostic.selection_reason}`
+                ? ` - ${assessment.response_diagnostic.selection_reason}`
                 : ''}
             </Typography>
           )}
@@ -835,7 +877,7 @@ function GatewayBypassResults({ report }) {
       )}
       {report?.port_range && (
         <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
-          Port range {report.port_range.start}–{report.port_range.end}; scanned{' '}
+          Phạm vi cổng {report.port_range.start}-{report.port_range.end}; đã quét{' '}
           {report.ports_scanned ?? 0} non-Gateway service ports.
         </Typography>
       )}
@@ -867,7 +909,7 @@ function GatewayBypassResults({ report }) {
             <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
               Verified from {service.verification_evidence?.method}{' '}
               {service.verification_evidence?.path} · HTTP{' '}
-              {service.verification_evidence?.status_code ?? '—'} ·{' '}
+              {service.verification_evidence?.status_code ?? '-'} ·{' '}
               {service.verification_evidence?.content_type ?? 'unknown content type'}
               {service.verification_evidence?.source === 'repeated_route_prefix'
                 ? ' · shared route prefix'
@@ -975,10 +1017,10 @@ function FindingDetail({ findings, endpointAssessments, target, onClose }) {
             )}
           </Box>
         ))}
-        <Typography variant="subtitle2" sx={{ mt: 2 }}>Test status and scope</Typography>
+        <Typography variant="subtitle2" sx={{ mt: 2 }}>Trạng thái kiểm thử và phạm vi</Typography>
         <Typography variant="body2" color="text.secondary">
           Finding status: {statusLabel}. Endpoint assessment: {endpoint?.assessment ?? 'Not reported'}.
-          {endpoint?.reason ? ` — ${endpoint.reason}` : ''}
+          {endpoint?.reason ? ` - ${endpoint.reason}` : ''}
         </Typography>
         <Typography variant="body2" color="text.secondary">
           Test case: {[...new Set(findings.map((item) => item.test_case).filter(Boolean))].join(', ') || 'Not reported'}
@@ -1003,38 +1045,38 @@ function FindingDetail({ findings, endpointAssessments, target, onClose }) {
             ))}
           </Box>
         )}
-        <Typography variant="subtitle2" sx={{ mt: 2 }}>Recommended remediation</Typography>
+        <Typography variant="subtitle2" sx={{ mt: 2 }}>Khuyến nghị khắc phục</Typography>
         {findings.map((item, index) => (
           <Box key={`${item.test_case}-recommendation-${index}`} sx={{ mb: 1.5 }}>
             <Typography variant="body2">
-              {item.recommendation || 'Review and enforce the intended authorization policy.'}
+              {localizeReportText(item.recommendation || 'Review and enforce the intended authorization policy.')}
             </Typography>
             {item.remediation && (
               <Box sx={{ mt: 1, p: 1.5, border: '1px solid #334155', borderRadius: 1 }}>
-                <Typography variant="subtitle2">Suggested fix</Typography>
+                <Typography variant="subtitle2">Gợi ý khắc phục</Typography>
                 <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                  {item.remediation.root_cause}
+                  {localizeReportText(item.remediation.root_cause)}
                 </Typography>
                 <Box component="ul" sx={{ mt: 0.75, mb: 0, pl: 3 }}>
                   {(item.remediation.actions ?? []).map((action, actionIndex) => (
                     <li key={`${actionIndex}-${action}`}>
-                      <Typography variant="body2">{action}</Typography>
+                      <Typography variant="body2">{localizeReportText(action)}</Typography>
                     </li>
                   ))}
                 </Box>
                 <Typography variant="subtitle2" sx={{ mt: 1 }}>
-                  Retest
+                  Kiểm thử lại
                 </Typography>
                 <Box component="ul" sx={{ mt: 0.5, mb: 0, pl: 3 }}>
                   {(item.remediation.retest_steps ?? []).map((step, stepIndex) => (
                     <li key={`${stepIndex}-${step}`}>
-                      <Typography variant="body2">{step}</Typography>
+                      <Typography variant="body2">{localizeReportText(step)}</Typography>
                     </li>
                   ))}
                 </Box>
                 <Typography color="text.secondary" variant="caption" display="block" sx={{ mt: 1 }}>
-                  Suggested priority: {item.remediation.suggested_priority ?? 'review'}.{' '}
-                  {item.remediation.limitation} {item.remediation.note}
+                  Mức ưu tiên đề xuất: {localizeReportPriority(item.remediation.suggested_priority)}.{' '}
+                  {localizeReportText(item.remediation.limitation)} {localizeReportText(item.remediation.note)}
                 </Typography>
               </Box>
             )}
@@ -1259,7 +1301,7 @@ function ExecutiveSummary({ summary }) {
         }
       >
         <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
-          {conclusion?.label ?? 'Inconclusive — Further Testing Required'}
+          {conclusion?.label ?? 'Inconclusive - Further Testing Required'}
         </Typography>
         {conclusion?.message && (
           <Typography variant="body2">{conclusion.message}</Typography>
@@ -1330,7 +1372,7 @@ function ExecutiveSummary({ summary }) {
             >
               {attempt.method} {attempt.path}: {attempt.status}
               {attempt.http_status ? ` (HTTP ${attempt.http_status})` : ''}
-              {attempt.reason ? ` — ${attempt.reason}` : ''}
+              {attempt.reason ? ` - ${attempt.reason}` : ''}
             </Typography>
           ))}
         </Box>
@@ -1340,14 +1382,46 @@ function ExecutiveSummary({ summary }) {
 }
 
 function App() {
-  const [target, setTarget] = useState('')
-  const [scanMode, setScanMode] = useState('standard')
-  const [selectedModules, setSelectedModules] = useState({
-    jwt_authentication: false,
-    bola: false,
-    rate_limit: false,
-    gateway_bypass: false,
+  const [target, setTarget] = useState(() =>
+    typeof window === 'undefined'
+      ? ''
+      : window.localStorage.getItem('microscan-target') || '',
+  )
+  const [scanMode, setScanMode] = useState(() =>
+    typeof window === 'undefined'
+      ? 'standard'
+      : window.localStorage.getItem('microscan-scan-mode') || 'standard',
+  )
+  const [selectedModules, setSelectedModules] = useState(() => {
+    if (typeof window === 'undefined') {
+      return { jwt_authentication: false, bola: false, rate_limit: false, gateway_bypass: false }
+    }
+    try {
+      return {
+        jwt_authentication: false,
+        bola: false,
+        rate_limit: false,
+        gateway_bypass: false,
+        ...JSON.parse(window.localStorage.getItem('microscan-selected-modules') || '{}'),
+      }
+    } catch {
+      return { jwt_authentication: false, bola: false, rate_limit: false, gateway_bypass: false }
+    }
   })
+  const [jwtAllowlistText, setJwtAllowlistText] = useState(() =>
+    typeof window === 'undefined'
+      ? ''
+      : window.localStorage.getItem('microscan-jwt-allowlist') || '',
+  )
+  const [jwtEndpointBudget, setJwtEndpointBudget] = useState(() =>
+    getStoredNumber('microscan-jwt-endpoint-budget', 5, 1, 100),
+  )
+  const [bolaRequestBudget, setBolaRequestBudget] = useState(() =>
+    getStoredNumber('microscan-bola-request-budget', 10, 1, 100),
+  )
+  const [rateLimitRequestBudget, setRateLimitRequestBudget] = useState(() =>
+    getStoredNumber('microscan-rate-limit-request-budget', 100, 1, 1000),
+  )
   const [gatewayBypassPortStart, setGatewayBypassPortStart] = useState('8000')
   const [gatewayBypassPortEnd, setGatewayBypassPortEnd] = useState('8100')
   const scanAbortController = useRef(null)
@@ -1372,8 +1446,18 @@ function App() {
   const [activePage, setActivePage] = useState('Dashboard')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [useDefaultWordlist, setUseDefaultWordlist] = useState(true)
+  const [selectedWordlist, setSelectedWordlist] = useState(getStoredWordlist)
+  const [useCustomWordlist, setUseCustomWordlist] = useState(false)
   const [customWordlist, setCustomWordlist] = useState('')
+  const [wordlists, setWordlists] = useState([])
+  const [wordlistLoading, setWordlistLoading] = useState(false)
+  const [wordlistError, setWordlistError] = useState('')
+  const [fileWordlistLimit, setFileWordlistLimit] = useState(() =>
+    getStoredNumber('microscan-file-wordlist-limit', 100, 1, 1000),
+  )
+  const [kiterunnerLimit, setKiterunnerLimit] = useState(() =>
+    getStoredKiterunnerLimit(),
+  )
   const [requestsPerSecond, setRequestsPerSecond] = useState(2)
   const [fileTimeout, setFileTimeout] = useState(5)
   const [fileConcurrency, setFileConcurrency] = useState(2)
@@ -1389,11 +1473,103 @@ function App() {
   const [apiMapCategory, setApiMapCategory] = useState('actionable')
   const [statusFilter, setStatusFilter] = useState('')
 
+  const refreshWordlists = useCallback(async () => {
+    try {
+      const response = await fetch(`${apiBaseUrl}/file-discovery/wordlists`)
+      const payload = await response.json()
+      if (!response.ok) {
+        throw new Error(payload?.detail || `HTTP ${response.status}`)
+      }
+      const available = Array.isArray(payload.wordlists) ? payload.wordlists : []
+      setWordlistError('')
+      setWordlists(available)
+      setSelectedWordlist((current) => {
+        if (available.some((item) => item.id === current)) {
+          return current
+        }
+        return available.some((item) => item.id === payload.default)
+          ? payload.default
+          : available[0]?.id || defaultWordlistFile
+      })
+    } catch (caughtError) {
+      setWordlistError(caughtError.message || 'Wordlists could not be loaded.')
+    } finally {
+      setWordlistLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    window.localStorage.setItem('microscan-wordlist', selectedWordlist)
+  }, [selectedWordlist])
+
+  useEffect(() => {
+    window.localStorage.setItem('microscan-file-wordlist-limit', String(fileWordlistLimit))
+  }, [fileWordlistLimit])
+
+  useEffect(() => {
+    window.localStorage.setItem('microscan-kiterunner-limit-v3', String(kiterunnerLimit))
+  }, [kiterunnerLimit])
+
+  useEffect(() => {
+    window.localStorage.setItem('microscan-jwt-allowlist', jwtAllowlistText)
+  }, [jwtAllowlistText])
+
+  useEffect(() => {
+    window.localStorage.setItem('microscan-jwt-endpoint-budget', String(jwtEndpointBudget))
+  }, [jwtEndpointBudget])
+
+  useEffect(() => {
+    window.localStorage.setItem('microscan-bola-request-budget', String(bolaRequestBudget))
+  }, [bolaRequestBudget])
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      'microscan-rate-limit-request-budget',
+      String(rateLimitRequestBudget),
+    )
+  }, [rateLimitRequestBudget])
+
+  useEffect(() => {
+    window.localStorage.setItem('microscan-target', target)
+  }, [target])
+
+  useEffect(() => {
+    window.localStorage.setItem('microscan-scan-mode', scanMode)
+  }, [scanMode])
+
+  useEffect(() => {
+    window.localStorage.setItem('microscan-selected-modules', JSON.stringify(selectedModules))
+  }, [selectedModules])
+
   useEffect(() => {
     if (selectedFinding) {
       document.getElementById('finding-detail')?.scrollIntoView({ block: 'nearest' })
     }
   }, [selectedFinding])
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+  }, [activePage])
+
+  const navigateToPage = (page) => {
+    setActivePage(page)
+    if (page === 'Settings') {
+      setWordlistLoading(true)
+      setWordlistError('')
+      refreshWordlists()
+    }
+  }
+
+  const selectedWordlistInfo = wordlists.find((item) => item.id === selectedWordlist)
+  const selectedWordlistLineCount = selectedWordlistInfo?.line_count ?? 0
+  const fileWordlistLimitMax = selectedWordlistLineCount
+    ? Math.min(1000, selectedWordlistLineCount)
+    : 1000
+  const kiterunnerLimitMax = selectedWordlistLineCount
+    ? selectedWordlistLineCount
+    : 500000
+  const effectiveFileWordlistLimit = Math.min(fileWordlistLimit, fileWordlistLimitMax)
+  const effectiveKiterunnerLimit = Math.min(kiterunnerLimit, kiterunnerLimitMax)
 
   const endpointSummary = useMemo(() => {
     const discovered = scanResults.filter((item) => item.discovered !== false)
@@ -1419,6 +1595,29 @@ function App() {
       setError('Enter both the start and end port, or leave both blank for the default range.')
       return
     }
+    let jwtAllowlist = null
+    if (selectedModules.jwt_authentication && jwtAllowlistText.trim()) {
+      try {
+        jwtAllowlist = JSON.parse(jwtAllowlistText)
+        if (!Array.isArray(jwtAllowlist)) {
+          throw new Error('JWT allowlist must be a JSON array.')
+        }
+        const invalid = jwtAllowlist.find((entry) =>
+          !entry
+          || typeof entry !== 'object'
+          || !String(entry.path || '').startsWith('/')
+          || !['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(
+            String(entry.method || 'GET').toUpperCase(),
+          ),
+        )
+        if (invalid) {
+          throw new Error('Each JWT allowlist entry must use a supported HTTP method and start with /.')
+        }
+      } catch (caughtError) {
+        setError(caughtError.message || 'JWT allowlist is not valid JSON.')
+        return
+      }
+    }
 
     setLoading(true)
     setError('')
@@ -1430,6 +1629,7 @@ function App() {
       const scanParams = new URLSearchParams({
         target: scanTarget,
         num: '200',
+        kiterunner_limit: String(effectiveKiterunnerLimit),
         auto_jwt_local_lab: String(
           selectedModules.jwt_authentication || selectedModules.bola,
         ),
@@ -1440,6 +1640,14 @@ function App() {
         rate_limit_testing: String(selectedModules.rate_limit),
         gateway_bypass_testing: String(selectedModules.gateway_bypass),
       })
+      scanParams.set('wordlist_name', selectedWordlist)
+      scanParams.set('wordlist_limit', String(effectiveFileWordlistLimit))
+      if (jwtAllowlist) {
+        scanParams.set('jwt_allowlist', JSON.stringify(jwtAllowlist))
+      }
+      scanParams.set('jwt_endpoint_budget', String(jwtEndpointBudget))
+      scanParams.set('bola_request_budget', String(bolaRequestBudget))
+      scanParams.set('rate_limit_request_budget', String(rateLimitRequestBudget))
       if (
         !isFollowupScan
         && selectedModules.gateway_bypass
@@ -1616,7 +1824,9 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           target: scanTarget,
-          wordlist: useDefaultWordlist ? null : customWordlist,
+          wordlist: useCustomWordlist ? customWordlist : null,
+          wordlist_name: useCustomWordlist ? null : selectedWordlist,
+          wordlist_limit: effectiveFileWordlistLimit,
           requests_per_second: Number(requestsPerSecond),
           timeout: Number(fileTimeout),
           concurrency: Number(fileConcurrency),
@@ -1703,7 +1913,7 @@ function App() {
           </Typography>
         </Toolbar>
 
-        <SidebarNavigation activePage={activePage} onNavigate={setActivePage} />
+        <SidebarNavigation activePage={activePage} onNavigate={navigateToPage} />
       </Drawer>
 
       <Box
@@ -1717,23 +1927,23 @@ function App() {
         }}
       >
         <Typography variant="h4" sx={{ fontWeight: 700, mb: 1, color: '#E5E7EB' }}>
-          {activePage === 'Dashboard' && 'Security Dashboard'}
-          {activePage === 'Scan' && 'Endpoint Discovery'}
-          {activePage === 'File Discovery' && 'File Discovery'}
-          {activePage === 'API Map' && 'API Endpoint Map'}
-          {activePage === 'Reports' && 'Scan Reports'}
-          {activePage === 'Settings' && 'Settings'}
-          {activePage === 'Introduction' && 'Introduction'}
+          {activePage === 'Dashboard' && 'Tổng quan bảo mật'}
+          {activePage === 'Scan' && 'Khám phá endpoint'}
+          {activePage === 'File Discovery' && 'Khám phá file'}
+          {activePage === 'API Map' && 'Sơ đồ endpoint API'}
+          {activePage === 'Reports' && 'Báo cáo quét'}
+          {activePage === 'Settings' && 'Cài đặt'}
+          {activePage === 'Introduction' && 'Hướng dẫn'}
         </Typography>
 
         <Typography sx={{ mb: 4, color: '#94A3B8' }}>
-          {activePage === 'Dashboard' && 'Web & Microservice Security Scanner'}
-          {activePage === 'Scan' && 'Discover API endpoints with Kiterunner'}
-          {activePage === 'File Discovery' && 'Find common files and analyze frontend JavaScript'}
-          {activePage === 'API Map' && 'Visualize discovered API endpoints by path and HTTP method'}
-          {activePage === 'Reports' && 'Review your previous scan results'}
-          {activePage === 'Settings' && 'Configure your scanner'}
-          {activePage === 'Introduction' && 'Learn about API security and interpreting MicroScan results'}
+          {activePage === 'Dashboard' && 'Máy quét bảo mật Web & Microservice'}
+          {activePage === 'Scan' && 'Khám phá endpoint API bằng Kiterunner'}
+          {activePage === 'File Discovery' && 'Tìm file phổ biến và phân tích JavaScript'}
+          {activePage === 'API Map' && 'Trực quan hóa endpoint theo đường dẫn và phương thức'}
+          {activePage === 'Reports' && 'Xem lại các kết quả quét'}
+          {activePage === 'Settings' && 'Cấu hình máy quét'}
+          {activePage === 'Introduction' && 'Tìm hiểu bảo mật API và cách đọc kết quả'}
         </Typography>
 
         {error && (
@@ -1818,24 +2028,24 @@ function App() {
 
               <Box component="details" sx={{ flex: '1 1 100%', mt: 1 }}>
                 <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 600 }}>
-                  Scan options — {scanMode === 'full' ? 'Full scan' : 'Standard scan'} ·{' '}
+                  Scan options - {scanMode === 'full' ? 'Full scan' : 'Standard scan'} ·{' '}
                   {selectedModuleCount > 0
                     ? `${selectedModuleCount} security checks`
                     : 'Discovery only'}
                 </Box>
                 <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap', mt: 1 }}>
                   <FormControl sx={{ minWidth: 180 }}>
-                    <InputLabel id="scan-mode-label">Scan mode</InputLabel>
+                    <InputLabel id="scan-mode-label">Chế độ quét</InputLabel>
                     <Select
                       labelId="scan-mode-label"
                       id="scan-mode"
                       value={scanMode}
-                      label="Scan mode"
+                      label="Chế độ quét"
                       onChange={(event) => setScanMode(event.target.value)}
                       disabled={loading}
                     >
-                      <MenuItem value="standard">Standard Scan</MenuItem>
-                      <MenuItem value="full">Full Scan</MenuItem>
+                      <MenuItem value="standard">Quét tiêu chuẩn</MenuItem>
+                      <MenuItem value="full">Quét đầy đủ</MenuItem>
                     </Select>
                   </FormControl>
                   <Box sx={{ flex: '1 1 100%' }}>
@@ -1930,7 +2140,7 @@ function App() {
                   />
                   <Box component="details" sx={{ mt: 2 }}>
                     <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
-                      Findings ({findings.length}) — select a finding for details
+                      Findings ({findings.length}) - select a finding for details
                     </Box>
                     <FindingGroups
                       findings={findings}
@@ -2009,7 +2219,7 @@ function App() {
               </Typography>
             <Box
               component="input"
-              aria-label="Search discovered endpoints"
+              aria-label="Tìm endpoint đã khám phá"
               placeholder="Search path, origin, method, or source"
               value={searchQuery}
               onChange={(event) => setSearchQuery(event.target.value)}
@@ -2113,20 +2323,8 @@ function App() {
                 </Typography>
 
                 <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
-                  <FormControl fullWidth size="small">
-                    <InputLabel id="file-wordlist-label">Wordlist</InputLabel>
-                    <Select
-                      labelId="file-wordlist-label"
-                      value={useDefaultWordlist ? 'default' : 'custom'}
-                      label="Wordlist"
-                      onChange={(event) => setUseDefaultWordlist(event.target.value === 'default')}
-                    >
-                      <MenuItem value="default">MicroScan default</MenuItem>
-                      <MenuItem value="custom">Custom paths</MenuItem>
-                    </Select>
-                  </FormControl>
                   <Box>
-                    <Typography variant="body2" sx={{ mb: 0.5 }}>Request rate (per second, max 5)</Typography>
+                    <Typography variant="body2" sx={{ mb: 0.5 }}>Tốc độ request (mỗi giây, tối đa 5)</Typography>
                     <Box component="input" type="number" min="0.5" max="5" step="0.5" value={requestsPerSecond} onChange={(event) => setRequestsPerSecond(event.target.value)} sx={{ width: '100%', boxSizing: 'border-box', px: 1.5, py: 1.2, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB' }} />
                   </Box>
                   <Box>
@@ -2139,10 +2337,20 @@ function App() {
                   </Box>
                 </Box>
 
-                {!useDefaultWordlist && (
+                <FormControlLabel
+                  sx={{ display: 'flex', mt: 1 }}
+                  control={(
+                    <Checkbox
+                      checked={useCustomWordlist}
+                      onChange={(event) => setUseCustomWordlist(event.target.checked)}
+                    />
+                  )}
+                  label="Use custom paths instead of the Settings wordlist"
+                />
+                {useCustomWordlist && (
                   <Box
                     component="textarea"
-                    aria-label="Custom wordlist"
+                    aria-label="Wordlist tùy chỉnh"
                     placeholder={'robots.txt\nsitemap.xml\napi/v1'}
                     value={customWordlist}
                     onChange={(event) => setCustomWordlist(event.target.value)}
@@ -2183,6 +2391,8 @@ function App() {
                 {fileDiscoverySummary.requests_made !== undefined && (
                   <Typography color="text.secondary" variant="body2" sx={{ mb: 2 }}>
                     {fileDiscoverySummary.scripts_analyzed} JavaScript file(s) analyzed · {fileDiscoverySummary.requests_made} request(s) sent
+                    {fileDiscoverySummary.wordlist_name ? ` · Wordlist: ${fileDiscoverySummary.wordlist_name}` : ''}
+                    {fileDiscoverySummary.wordlist_truncated ? ` · limited to the first ${fileDiscoverySummary.wordlist_paths} paths` : ''}
                     {fileDiscoverySummary.execution_time_limited ? ' · execution time limit reached; remaining results are inconclusive' : ''}
                   </Typography>
                 )}
@@ -2195,7 +2405,7 @@ function App() {
                   <FormControl size="small" sx={{ minWidth: 190 }}>
                     <InputLabel id="file-source-label">Source</InputLabel>
                     <Select labelId="file-source-label" value={sourceFilter} label="Source" onChange={(event) => setSourceFilter(event.target.value)}>
-                      <MenuItem value="all">All sources</MenuItem>
+                      <MenuItem value="all">Tất cả nguồn</MenuItem>
                       <MenuItem value="wordlist">Wordlist</MenuItem>
                       <MenuItem value="html">HTML</MenuItem>
                       <MenuItem value="javascript">JavaScript</MenuItem>
@@ -2204,29 +2414,29 @@ function App() {
                     </Select>
                   </FormControl>
                   <FormControl size="small" sx={{ minWidth: 190 }}>
-                    <InputLabel id="file-verification-label">Verification</InputLabel>
-                    <Select labelId="file-verification-label" value={verificationFilter} label="Verification" onChange={(event) => setVerificationFilter(event.target.value)}>
-                      <MenuItem value="all">All states</MenuItem>
-                      <MenuItem value="discovered">Discovered</MenuItem>
-                      <MenuItem value="verified">Verified</MenuItem>
-                      <MenuItem value="inconclusive">Inconclusive</MenuItem>
-                      <MenuItem value="blocked">Blocked</MenuItem>
-                      <MenuItem value="not_found">Not found</MenuItem>
+                    <InputLabel id="file-verification-label">Xác minh</InputLabel>
+                    <Select labelId="file-verification-label" value={verificationFilter} label="Xác minh" onChange={(event) => setVerificationFilter(event.target.value)}>
+                      <MenuItem value="all">Tất cả trạng thái</MenuItem>
+                      <MenuItem value="discovered">Đã khám phá</MenuItem>
+                      <MenuItem value="verified">Đã xác minh</MenuItem>
+                      <MenuItem value="inconclusive">Chưa kết luận</MenuItem>
+                      <MenuItem value="blocked">Bị chặn</MenuItem>
+                      <MenuItem value="not_found">Không tìm thấy</MenuItem>
                     </Select>
                   </FormControl>
-                  <Box component="input" type="number" aria-label="Filter by status code" placeholder="Status code prefix" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} sx={{ width: 180, px: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB' }} />
+                  <Box component="input" type="number" aria-label="Lọc theo mã trạng thái" placeholder="Tiền tố mã trạng thái" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} sx={{ width: 180, px: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB' }} />
                 </Box>
                 <Card sx={{ overflowX: 'auto' }}>
                   <Table size="small">
                     <TableHead>
                       <TableRow>
                         <TableCell>URL</TableCell>
-                        <TableCell>Method</TableCell>
-                        <TableCell>Status</TableCell>
+                        <TableCell>Phương thức</TableCell>
+                        <TableCell>Trạng thái</TableCell>
                         <TableCell>Content type</TableCell>
-                        <TableCell>Source</TableCell>
-                        <TableCell>Verification</TableCell>
-                        <TableCell>Evidence</TableCell>
+                        <TableCell>Nguồn</TableCell>
+                        <TableCell>Xác minh</TableCell>
+                        <TableCell>Bằng chứng</TableCell>
                       </TableRow>
                     </TableHead>
                     <TableBody>
@@ -2236,8 +2446,8 @@ function App() {
                         <TableRow key={`${item.method}-${item.url}-${index}`}>
                           <TableCell sx={{ maxWidth: 360, overflowWrap: 'anywhere' }}>{item.url}</TableCell>
                           <TableCell>{item.method ?? 'UNKNOWN'}</TableCell>
-                          <TableCell>{item.status_code ?? '—'}</TableCell>
-                          <TableCell>{item.content_type ?? '—'}</TableCell>
+                          <TableCell>{item.status_code ?? '-'}</TableCell>
+                          <TableCell>{item.content_type ?? '-'}</TableCell>
                           <TableCell>{(item.sources ?? []).map((source) => <Chip key={source} label={source} size="small" sx={{ mr: 0.5, mb: 0.5 }} />)}</TableCell>
                           <TableCell>{item.verification_status ?? 'discovered'}</TableCell>
                           <TableCell>
@@ -2251,7 +2461,7 @@ function App() {
                                   </Box>
                                 ))}
                               </Box>
-                            ) : '—'}
+                            ) : '-'}
                           </TableCell>
                         </TableRow>
                       ))}
@@ -2414,7 +2624,7 @@ function App() {
 
             {scanCount > 0 && (
               <>
-                <Typography variant="h5" sx={{ mt: 4, mb: 1 }}>Findings</Typography>
+                <Typography variant="h5" sx={{ mt: 4, mb: 1 }}>Phát hiện</Typography>
                 <FindingGroups
                   findings={findings}
                   onSelect={(finding) => setSelectedFinding(finding)}
@@ -2463,7 +2673,7 @@ function App() {
                     <DiscoveryProgress stages={scanStages} loading={loading} />
                     {scanStages.map((stage, index) => (
                       <Typography key={`${stage.stage}-${index}`} display="block" variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                        {stage.stage}: {stage.status}{stage.detail ? ` — ${stage.detail}` : ''}
+                        {stage.stage}: {stage.status}{stage.detail ? ` - ${stage.detail}` : ''}
                       </Typography>
                     ))}
                     <ExecutiveSummary summary={summary} />
@@ -2480,9 +2690,9 @@ function App() {
                         onChange={setDiscoveryCategoryFilter}
                       />
                       <FormControl size="small" sx={{ minWidth: 190 }}>
-                        <InputLabel id="report-source-label">Discovery source</InputLabel>
-                        <Select labelId="report-source-label" value={sourceFilter} label="Discovery source" onChange={(event) => setSourceFilter(event.target.value)}>
-                          <MenuItem value="all">All sources</MenuItem>
+                        <InputLabel id="report-source-label">Nguồn khám phá</InputLabel>
+                        <Select labelId="report-source-label" value={sourceFilter} label="Nguồn khám phá" onChange={(event) => setSourceFilter(event.target.value)}>
+                          <MenuItem value="all">Tất cả nguồn</MenuItem>
                           <MenuItem value="kiterunner">Kiterunner</MenuItem>
                           <MenuItem value="kiterunner_seeded">Kiterunner seed scan</MenuItem>
                           <MenuItem value="wordlist">File Discovery</MenuItem>
@@ -2492,17 +2702,17 @@ function App() {
                         </Select>
                       </FormControl>
                       <FormControl size="small" sx={{ minWidth: 190 }}>
-                        <InputLabel id="report-verification-label">Verification</InputLabel>
-                        <Select labelId="report-verification-label" value={verificationFilter} label="Verification" onChange={(event) => setVerificationFilter(event.target.value)}>
-                          <MenuItem value="all">All states</MenuItem>
-                          <MenuItem value="discovered">Discovered</MenuItem>
-                          <MenuItem value="verified">Verified</MenuItem>
-                          <MenuItem value="inconclusive">Inconclusive</MenuItem>
-                          <MenuItem value="blocked">Blocked</MenuItem>
-                          <MenuItem value="not_found">Not found</MenuItem>
+                        <InputLabel id="report-verification-label">Xác minh</InputLabel>
+                        <Select labelId="report-verification-label" value={verificationFilter} label="Xác minh" onChange={(event) => setVerificationFilter(event.target.value)}>
+                          <MenuItem value="all">Tất cả trạng thái</MenuItem>
+                          <MenuItem value="discovered">Đã khám phá</MenuItem>
+                          <MenuItem value="verified">Đã xác minh</MenuItem>
+                          <MenuItem value="inconclusive">Chưa kết luận</MenuItem>
+                          <MenuItem value="blocked">Bị chặn</MenuItem>
+                          <MenuItem value="not_found">Không tìm thấy</MenuItem>
                         </Select>
                       </FormControl>
-                      <Box component="input" type="number" aria-label="Filter discovery by status code" placeholder="Status code prefix" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} sx={{ width: 180, px: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB' }} />
+                      <Box component="input" type="number" aria-label="Lọc khám phá theo mã trạng thái" placeholder="Tiền tố mã trạng thái" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} sx={{ width: 180, px: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB' }} />
                     </Box>
                     <DiscoveryResultsTable results={visibleScanDiscoveryResults} />
                   </Box>
@@ -2526,7 +2736,7 @@ function App() {
                     </Typography>
                     {summary.jwt_selection_budgets?.map((budget, index) => (
                       <Typography key={`jwt-budget-${index}`} color="text.secondary" variant="body2">
-                        JWT selection budget ({budget.mode ?? 'unknown'}): {budget.used ?? '—'} of {budget.configured ?? 'not applicable'} group(s) used
+                        JWT selection budget ({budget.mode ?? 'unknown'}): {budget.used ?? '-'} of {budget.configured ?? 'not applicable'} group(s) used
                         {budget.remaining != null ? ` · ${budget.remaining} remaining` : ''}
                       </Typography>
                     ))}
@@ -2585,114 +2795,264 @@ function App() {
         )}
 
         {activePage === 'Settings' && (
-          <Card>
-            <CardContent>
-              <Typography variant="h6" sx={{ mb: 1 }}>
-                Scanner Configuration
-              </Typography>
-              <Typography color="text.secondary" sx={{ mb: 3 }}>
-                Configure the assessment target and API discovery options. Use targets that are within your approved assessment scope.
-              </Typography>
+          <Box sx={{ display: 'grid', gap: 2, maxWidth: 1000 }}>
+            <Card component="section">
+              <CardContent>
+                <Typography variant="h6" sx={{ mb: 0.5 }}>Mục tiêu quét</Typography>
+                <Box
+                  component="input"
+                  aria-label="URL mục tiêu quét"
+                  value={target}
+                  placeholder="https://api.example.com"
+                  onChange={(event) => setTarget(event.target.value)}
+                  sx={{
+                    boxSizing: 'border-box',
+                    width: '100%',
+                    maxWidth: 560,
+                    px: 2,
+                    py: 1.5,
+                    borderRadius: 1,
+                    border: '1px solid #334155',
+                    backgroundColor: '#111827',
+                    color: '#E5E7EB',
+                    fontSize: '1rem',
+                  }}
+                />
+              </CardContent>
+            </Card>
 
-              <Typography sx={{ mb: 1 }}>Scan target URL</Typography>
-              <Box
-                component="input"
-                value={target}
-                placeholder="https://api.example.com"
-                onChange={(event) => setTarget(event.target.value)}
-                sx={{
-                  boxSizing: 'border-box',
-                  width: '100%',
-                  maxWidth: 500,
-                  px: 2,
-                  py: 1.5,
-                  borderRadius: 1,
-                  border: '1px solid #334155',
-                  backgroundColor: '#111827',
-                  color: '#E5E7EB',
-                  fontSize: '1rem',
-                }}
-              />
-
-              <Typography sx={{ mt: 3, mb: 1 }}>
-                Gateway Bypass port range for Standard Scan
-              </Typography>
-              <Box
-                sx={{
-                  display: 'flex',
-                  gap: 2,
-                  maxWidth: 500,
-                }}
-              >
-                <Box sx={{ width: '50%' }}>
-                  <Typography variant="caption">Start port</Typography>
-                  <Box
-                    component="input"
-                    type="number"
-                    min="1"
-                    aria-label="Gateway Bypass port range start"
-                    value={gatewayBypassPortStart}
-                    placeholder="Auto"
-                    disabled={scanMode === 'full'}
-                    onChange={(event) => setGatewayBypassPortStart(event.target.value)}
-                    sx={{
-                      boxSizing: 'border-box',
-                      width: '100%',
-                      px: 2,
-                      py: 1.5,
-                      borderRadius: 1,
-                      border: '1px solid #334155',
-                      backgroundColor: '#111827',
-                      color: '#E5E7EB',
-                      fontSize: '1rem',
-                    }}
+            <Card component="section">
+              <CardContent>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
+                  <Typography variant="h6">JWT / Xác thực</Typography>
+                  <FormControlLabel
+                    disabled={loading}
+                    control={<Checkbox checked={selectedModules.jwt_authentication} onChange={(event) => setSelectedModules((current) => ({ ...current, jwt_authentication: event.target.checked }))} />}
+                    label="Bật trong lượt quét"
                   />
                 </Box>
-                <Box sx={{ width: '50%' }}>
-                  <Typography variant="caption">End port</Typography>
-                  <Box
-                    component="input"
-                    type="number"
-                    min="1"
-                    aria-label="Gateway Bypass port range end"
-                    value={gatewayBypassPortEnd}
-                    placeholder="Auto"
-                    disabled={scanMode === 'full'}
-                    onChange={(event) => setGatewayBypassPortEnd(event.target.value)}
-                    sx={{
-                      boxSizing: 'border-box',
-                      width: '100%',
-                      px: 2,
-                      py: 1.5,
-                      borderRadius: 1,
-                      border: '1px solid #334155',
-                      backgroundColor: '#111827',
-                      color: '#E5E7EB',
-                      fontSize: '1rem',
-                    }}
+                <Box sx={{ maxWidth: 260, mb: 2 }}>
+                  <Typography variant="body2" sx={{ mb: 0.5 }}>Ngân sách endpoint JWT</Typography>
+                  <Box component="input" type="number" min="1" max="100" aria-label="Ngân sách endpoint JWT" value={jwtEndpointBudget} onChange={(event) => { const value = Number(event.target.value); if (Number.isInteger(value) && value >= 1 && value <= 100) setJwtEndpointBudget(value) }} sx={{ boxSizing: 'border-box', width: '100%', px: 2, py: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB', fontSize: '1rem' }} />
+                  <Typography color="text.secondary" variant="caption" sx={{ display: 'block', mt: 0.75 }}>
+                    1-100; mặc định 5
+                  </Typography>
+                </Box>
+                <Typography variant="subtitle1" sx={{ mb: 0.5 }}>Danh sách endpoint được phép</Typography>
+                <Box component="textarea"                 aria-label="Danh sách endpoint JWT được phép" value={jwtAllowlistText} placeholder={'[\n  {"method":"GET","path":"/api/orders"}\n]'} onChange={(event) => setJwtAllowlistText(event.target.value)} sx={{ boxSizing: 'border-box', width: '100%', maxWidth: 560, minHeight: 110, px: 2, py: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB', fontFamily: 'monospace', fontSize: '0.9rem', resize: 'vertical' }} />
+              </CardContent>
+            </Card>
+
+            <Card component="section">
+              <CardContent>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
+                  <Typography variant="h6">BOLA</Typography>
+                  <FormControlLabel disabled={loading} control={<Checkbox checked={selectedModules.bola} onChange={(event) => setSelectedModules((current) => ({ ...current, bola: event.target.checked }))} />} label="Bật trong lượt quét" />
+                </Box>
+                <Box sx={{ maxWidth: 260 }}>
+                  <Typography variant="body2" sx={{ mb: 0.5 }}>Ngân sách request BOLA</Typography>
+                  <Box component="input" type="number" min="1" max="100" aria-label="Ngân sách request BOLA" value={bolaRequestBudget} onChange={(event) => { const value = Number(event.target.value); if (Number.isInteger(value) && value >= 1 && value <= 100) setBolaRequestBudget(value) }} sx={{ boxSizing: 'border-box', width: '100%', px: 2, py: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB', fontSize: '1rem' }} />
+                  <Typography color="text.secondary" variant="caption" sx={{ display: 'block', mt: 0.75 }}>
+                    1-100; mặc định 10
+                  </Typography>
+                </Box>
+              </CardContent>
+            </Card>
+
+            <Card component="section">
+              <CardContent>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
+                  <Typography variant="h6">Rate Limit</Typography>
+                  <FormControlLabel disabled={loading} control={<Checkbox checked={selectedModules.rate_limit} onChange={(event) => setSelectedModules((current) => ({ ...current, rate_limit: event.target.checked }))} />} label="Bật trong lượt quét" />
+                </Box>
+                <Box sx={{ maxWidth: 260 }}>
+                  <Typography variant="body2" sx={{ mb: 0.5 }}>Số request tối đa mỗi lượt quét</Typography>
+                  <Box component="input" type="number" min="1" max="1000" aria-label="Số request Rate Limit tối đa" value={rateLimitRequestBudget} onChange={(event) => { const value = Number(event.target.value); if (Number.isInteger(value) && value >= 1 && value <= 1000) setRateLimitRequestBudget(value) }} sx={{ boxSizing: 'border-box', width: '100%', px: 2, py: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB', fontSize: '1rem' }} />
+                  <Typography color="text.secondary" variant="caption" sx={{ display: 'block', mt: 0.75 }}>
+                    1-1.000; mặc định 100
+                  </Typography>
+                </Box>
+              </CardContent>
+            </Card>
+
+            <Card component="section">
+              <CardContent>
+                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 2, flexWrap: 'wrap' }}>
+                  <Typography variant="h6">Gateway Bypass</Typography>
+                  <FormControlLabel
+                    disabled={loading}
+                    control={(
+                      <Checkbox
+                        checked={selectedModules.gateway_bypass}
+                        onChange={(event) => setSelectedModules((current) => ({
+                          ...current,
+                          gateway_bypass: event.target.checked,
+                        }))}
+                      />
+                    )}
+                    label="Bật trong lượt quét"
                   />
                 </Box>
-              </Box>
-              <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
-                Gateway Bypass comparison currently supports loopback services on the
-                scanner host. The input URL and origins/ports found in Discovery are
-                treated as Gateways and excluded from service candidates. Standard scans
-                up to 65 ports around the input Gateway port by default; enter both
-                bounds for a custom range (up to 10,000 ports). Full scans ports 1–65535
-                automatically. Repeated
-                identifier-style routes contribute shared prefixes for service
-                verification; Standard compares other eligible routes, while Full
-                compares every eligible discovered route. No route-count cap applies.
-              </Typography>
+                <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 260px))' }}>
+                  <Box>
+                    <Typography variant="body2" sx={{ mb: 0.5 }}>Cổng bắt đầu</Typography>
+                    <Box
+                      component="input"
+                      type="number"
+                      min="1"
+                      aria-label="Cổng bắt đầu Gateway Bypass"
+                      value={gatewayBypassPortStart}
+                      placeholder="Tự động"
+                      disabled={scanMode === 'full'}
+                      onChange={(event) => setGatewayBypassPortStart(event.target.value)}
+                      sx={{ boxSizing: 'border-box', width: '100%', px: 2, py: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB', fontSize: '1rem' }}
+                    />
+                  </Box>
+                  <Box>
+                    <Typography variant="body2" sx={{ mb: 0.5 }}>Cổng kết thúc</Typography>
+                    <Box
+                      component="input"
+                      type="number"
+                      min="1"
+                      aria-label="Cổng kết thúc Gateway Bypass"
+                      value={gatewayBypassPortEnd}
+                      placeholder="Tự động"
+                      disabled={scanMode === 'full'}
+                      onChange={(event) => setGatewayBypassPortEnd(event.target.value)}
+                      sx={{ boxSizing: 'border-box', width: '100%', px: 2, py: 1.5, borderRadius: 1, border: '1px solid #334155', backgroundColor: '#111827', color: '#E5E7EB', fontSize: '1rem' }}
+                    />
+                  </Box>
+                </Box>
+                <Typography color="text.secondary" variant="body2" sx={{ mt: 1.5 }}>
+                </Typography>
+              </CardContent>
+            </Card>
 
-              <Typography sx={{ mt: 3, mb: 1 }}>Discovery engine</Typography>
-              <Chip label="Kiterunner" color="primary" variant="outlined" />
+            <Card component="section">
+              <CardContent>
+                <Typography variant="h6" sx={{ mb: 0.5 }}>Khám phá API</Typography>
+                <Typography color="text.secondary" variant="body2" sx={{ mb: 2 }}>
+                </Typography>
+                <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
+                  <Box>
+                    <Typography variant="body2" sx={{ mb: 0.5 }}>
+                      Wordlist mặc định
+                    </Typography>
+                    <FormControl fullWidth size="small">
+                      <Select
+                        id="settings-wordlist"
+                        value={selectedWordlist}
+                        inputProps={{ 'aria-label': 'Wordlist mặc định' }}
+                        onChange={(event) => setSelectedWordlist(event.target.value)}
+                        disabled={wordlistLoading || wordlists.length === 0}
+                      >
+                        {wordlists.map((wordlist) => (
+                          <MenuItem key={wordlist.id} value={wordlist.id}>
+                            {wordlist.name} ({Number(wordlist.line_count ?? 0).toLocaleString()} paths)
+                            {wordlist.id === defaultWordlistFile ? ' (default)' : ''}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <Typography color="text.secondary" variant="caption" sx={{ display: 'block', mt: 0.75 }}>
+                    </Typography>
+                  </Box>
+                  <Box>
+                    <Typography variant="body2" sx={{ mb: 0.5 }}>
+                      Giới hạn đường dẫn File Discovery
+                    </Typography>
+                    <Box
+                      component="input"
+                      type="number"
+                      min="1"
+                      max={fileWordlistLimitMax}
+                      aria-label="Giới hạn đường dẫn File Discovery"
+                      value={effectiveFileWordlistLimit}
+                      onChange={(event) => {
+                        const value = Number(event.target.value)
+                        if (Number.isInteger(value) && value >= 1 && value <= fileWordlistLimitMax) {
+                          setFileWordlistLimit(value)
+                        }
+                      }}
+                      sx={{
+                        boxSizing: 'border-box',
+                        width: '100%',
+                        px: 2,
+                        py: 1.5,
+                        borderRadius: 1,
+                        border: '1px solid #334155',
+                        backgroundColor: '#111827',
+                        color: '#E5E7EB',
+                        fontSize: '1rem',
+                      }}
+                    />
+                    <Typography color="text.secondary" variant="caption" sx={{ display: 'block', mt: 0.75 }}>
+                      1-{fileWordlistLimitMax.toLocaleString()}; mặc định 100
+                    </Typography>
+                  </Box>
+                  <Box>
+                    <Typography variant="body2" sx={{ mb: 0.5 }}>
+                      Giới hạn route Kiterunner
+                    </Typography>
+                    <Box
+                      component="input"
+                      type="number"
+                      min="1"
+                      max={kiterunnerLimitMax}
+                      aria-label="Giới hạn route Kiterunner"
+                      value={effectiveKiterunnerLimit}
+                      onChange={(event) => {
+                        const value = Number(event.target.value)
+                        if (Number.isInteger(value) && value >= 1 && value <= kiterunnerLimitMax) {
+                          setKiterunnerLimit(value)
+                        }
+                      }}
+                      sx={{
+                        boxSizing: 'border-box',
+                        width: '100%',
+                        px: 2,
+                        py: 1.5,
+                        borderRadius: 1,
+                        border: '1px solid #334155',
+                        backgroundColor: '#111827',
+                        color: '#E5E7EB',
+                        fontSize: '1rem',
+                      }}
+                    />
+                    <Typography color="text.secondary" variant="caption" sx={{ display: 'block', mt: 0.75 }}>
+                      1-{kiterunnerLimitMax.toLocaleString()}; mặc định 200
+                    </Typography>
+                  </Box>
+                </Box>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap', mt: 2 }}>
+                  <Box
+                    component="button"
+                    type="button"
+                    onClick={() => {
+                      setWordlistLoading(true)
+                      refreshWordlists()
+                    }}
+                    disabled={wordlistLoading}
+                    sx={{
+                      px: 1.75,
+                      py: 0.875,
+                      border: '1px solid #334155',
+                      borderRadius: 1,
+                      backgroundColor: 'transparent',
+                      color: 'text.primary',
+                      cursor: wordlistLoading ? 'default' : 'pointer',
+                    }}
+                  >
+                    {wordlistLoading ? 'Đang tải...' : 'Làm mới wordlist'}
+                  </Box>
+                </Box>
+                {wordlistError && (
+                  <Alert severity="error" sx={{ mt: 2 }}>{wordlistError}</Alert>
+                )}
+              </CardContent>
+            </Card>
 
-              <Typography sx={{ mt: 3 }} color="text.secondary" variant="body2">
-                The backend validates the target URL and rejects malformed or out-of-scope requests.
-              </Typography>
-            </CardContent>
-          </Card>
+          </Box>
         )}
       </Box>
     </Box>

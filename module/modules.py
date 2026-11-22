@@ -1,4 +1,5 @@
 import ipaddress
+import json
 import os
 import re
 from urllib.parse import urlsplit
@@ -12,6 +13,7 @@ from module.signin import LoginConfigurationError, Signin
 
 _UNSELECTED = object()
 _READ_ONLY_METHODS = {"GET"}
+_JWT_TEST_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 _MAX_AUTOMATIC_JWT_ENDPOINTS = 5
 _MAX_AUTOMATIC_BOLA_ENDPOINTS = 5
 _MAX_CONFIGURED_JWT_ENDPOINTS = 100
@@ -46,10 +48,30 @@ class Modules:
         )
 
     @staticmethod
-    def _endpoint_allowlist():
-        # Endpoint selection now comes exclusively from the scoped Discovery inventory.
-        # Keeping this compatibility method prevents callers from needing to change.
-        return []
+    def _endpoint_allowlist(explicit_allowlist=None):
+        if explicit_allowlist is not None:
+            raw_entries = explicit_allowlist
+        else:
+            raw_entries = os.environ.get("MICROSCAN_JWT_ENDPOINT_ALLOWLIST", "").strip()
+            if not raw_entries:
+                return []
+            try:
+                raw_entries = json.loads(raw_entries)
+            except json.JSONDecodeError as exc:
+                raise ValueError("MICROSCAN_JWT_ENDPOINT_ALLOWLIST must be valid JSON.") from exc
+        if not isinstance(raw_entries, list):
+            raise ValueError("JWT endpoint allowlist must be a list.")
+
+        entries = []
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            method = str(entry.get("method") or "GET").upper()
+            path = str(entry.get("path") or "").strip()
+            if method not in _JWT_TEST_METHODS or not path.startswith("/"):
+                continue
+            entries.append({"method": method, "path": path})
+        return entries
 
     @staticmethod
     def _is_local_target(target):
@@ -96,7 +118,7 @@ class Modules:
     def _automatic_candidate_reason(self, endpoint):
         method = str(endpoint.get("method") or "").upper()
         path = endpoint.get("path") or ""
-        if method != "GET":
+        if method not in _JWT_TEST_METHODS:
             return None
         segments = [
             segment.lower()
@@ -171,7 +193,14 @@ class Modules:
         )
 
     @staticmethod
-    def _automatic_endpoint_budget():
+    def _automatic_endpoint_budget(configured_budget=None):
+        if configured_budget is not None:
+            budget = int(configured_budget)
+            if not 1 <= budget <= _MAX_CONFIGURED_JWT_ENDPOINTS:
+                raise ValueError(
+                    "JWT endpoint budget must be an integer between 1 and 100."
+                )
+            return budget
         raw = os.environ.get("MICROSCAN_JWT_ENDPOINT_BUDGET", "").strip()
         if not raw:
             return _MAX_AUTOMATIC_JWT_ENDPOINTS
@@ -188,7 +217,14 @@ class Modules:
         return budget
 
     @staticmethod
-    def _active_bola_request_budget():
+    def _active_bola_request_budget(configured_budget=None):
+        if configured_budget is not None:
+            budget = int(configured_budget)
+            if not 1 <= budget <= _MAX_CONFIGURED_JWT_ENDPOINTS:
+                raise ValueError(
+                    "Active BOLA request budget must be an integer between 1 and 100."
+                )
+            return budget
         raw = os.environ.get("MICROSCAN_BOLA_REQUEST_BUDGET", "").strip()
         if not raw:
             return _DEFAULT_ACTIVE_BOLA_REQUEST_BUDGET
@@ -408,6 +444,10 @@ class Modules:
         rate_limit_testing=False,
         jwt_testing=True,
         bola_testing=True,
+        jwt_allowlist=None,
+        jwt_endpoint_budget=None,
+        bola_request_budget=None,
+        rate_limit_request_budget=None,
     ):
         if scan_mode not in {"standard", "full"}:
             raise ValueError("scan_mode must be either 'standard' or 'full'.")
@@ -461,7 +501,7 @@ class Modules:
         )
         active_bola_budget = (
             {
-                "configured": self._active_bola_request_budget(),
+                "configured": self._active_bola_request_budget(bola_request_budget),
                 "used": 0,
             }
             if active_bola_enabled
@@ -490,97 +530,129 @@ class Modules:
             selection_mode = "not_selected"
             selection_budget["mode"] = selection_mode
             auto_mode_reason = "JWT authentication was not selected for this scan."
-        elif jwt_testing:
-            selection_mode = "automatic_local_lab"
-            selection_budget["mode"] = selection_mode
-            candidates_by_group = {}
-            for discovery_index, endpoint in enumerate(analyzed):
-                if endpoint.get("discovery_source") != "discovery":
-                    continue
-                identity = (endpoint.get("method") or "", endpoint.get("path"))
-                if endpoint.get("jwt_path_error"):
-                    continue
-                reason = self._automatic_candidate_reason(endpoint)
-                if reason:
-                    eligible_identities.add(identity)
-                    group = (identity[0], self._automatic_route_group(identity[1]))
-                    candidates_by_group.setdefault(group, []).append(
-                        (discovery_index, endpoint, identity, reason)
+        else:
+            allowlist_entries = self._endpoint_allowlist(jwt_allowlist)
+            if allowlist_entries:
+                selection_mode = "explicit_allowlist"
+                selection_budget["mode"] = selection_mode
+                allowlist_set = {
+                    (entry["method"], entry["path"])
+                    for entry in allowlist_entries
+                }
+                for discovery_index, endpoint in enumerate(analyzed):
+                    identity = (
+                        str(endpoint.get("method") or "").upper(),
+                        str(endpoint.get("path") or ""),
                     )
-
-            representatives = []
-            for group, candidates in candidates_by_group.items():
-                representative = min(
-                    candidates,
-                    key=lambda candidate: self._automatic_endpoint_priority(
-                        candidate[1], candidate[0]
-                    ),
+                    if identity not in allowlist_set:
+                        continue
+                    if endpoint.get("jwt_path_error"):
+                        continue
+                    if identity[0] not in _JWT_TEST_METHODS:
+                        continue
+                    reason = (
+                        "Endpoint is explicitly listed in the JWT endpoint allowlist "
+                        "for independent authentication testing."
+                    )
+                    eligible_identities.add(identity)
+                    selected_reasons[identity] = reason
+                endpoint_budget = len(selected_reasons)
+                selection_budget.update(
+                    {
+                        "configured": len(allowlist_entries),
+                        "used": len(selected_reasons),
+                        "remaining": max(len(allowlist_entries) - len(selected_reasons), 0),
+                    }
                 )
-                representatives.append((group, representative))
-
-            endpoint_budget = (
-                None
-                if scan_mode == "full"
-                else self._automatic_endpoint_budget()
-            )
-            ordered_representatives = sorted(
+            elif not auto_jwt_local_lab:
+                selection_mode = "not_confirmed"
+                selection_budget["mode"] = selection_mode
+                auto_mode_reason = (
+                    "Automatic JWT selection is disabled for this scan; enable the "
+                    "JWT authentication module and confirm local-lab mode."
+                )
+            else:
+                selection_mode = "automatic_local_lab"
+                selection_budget["mode"] = selection_mode
+                candidates_by_group = {}
+                for discovery_index, endpoint in enumerate(analyzed):
+                    if endpoint.get("discovery_source") != "discovery":
+                        continue
+                    identity = (endpoint.get("method") or "", endpoint.get("path"))
+                    if endpoint.get("jwt_path_error"):
+                        continue
+                    reason = self._automatic_candidate_reason(endpoint)
+                    if reason:
+                        eligible_identities.add(identity)
+                        group = (identity[0], self._automatic_route_group(identity[1]))
+                        candidates_by_group.setdefault(group, []).append(
+                            (discovery_index, endpoint, identity, reason)
+                        )
+                representatives = []
+                for group, candidates in candidates_by_group.items():
+                    representative = min(
+                        candidates,
+                        key=lambda candidate: self._automatic_endpoint_priority(
+                            candidate[1], candidate[0]
+                        ),
+                    )
+                    representatives.append((group, representative))
+                endpoint_budget = (
+                    None
+                    if scan_mode == "full"
+                    else self._automatic_endpoint_budget(jwt_endpoint_budget)
+                )
+                ordered_representatives = sorted(
                     representatives,
                     key=lambda item: self._automatic_endpoint_priority(
                         item[1][1], item[1][0]
                     ),
                 )
-            selected_groups = {
-                group
-                for group, _ in (
-                    ordered_representatives
-                    if endpoint_budget is None
-                    else ordered_representatives[:endpoint_budget]
-                )
-            }
-            selection_budget.update(
-                {
-                    "configured": endpoint_budget,
-                    "used": len(selected_groups),
-                    "remaining": (
-                        None
+                selected_groups = {
+                    group
+                    for group, _ in (
+                        ordered_representatives
                         if endpoint_budget is None
-                        else max(endpoint_budget - len(selected_groups), 0)
-                    ),
+                        else ordered_representatives[:endpoint_budget]
+                    )
                 }
-            )
-            representative_by_group = {
-                group: candidate for group, candidate in representatives
-            }
-            for group, candidates in candidates_by_group.items():
-                representative = representative_by_group[group]
-                representative_identity = representative[2]
-                if group in selected_groups:
-                    if scan_mode == "full":
-                        for _, _, identity, reason in candidates:
-                            selected_reasons[identity] = reason
+                selection_budget.update(
+                    {
+                        "configured": endpoint_budget,
+                        "used": len(selected_groups),
+                        "remaining": (
+                            None
+                            if endpoint_budget is None
+                            else max(endpoint_budget - len(selected_groups), 0)
+                        ),
+                    }
+                )
+                representative_by_group = {
+                    group: candidate for group, candidate in representatives
+                }
+                for group, candidates in candidates_by_group.items():
+                    representative = representative_by_group[group]
+                    representative_identity = representative[2]
+                    if group in selected_groups:
+                        if scan_mode == "full":
+                            for _, _, identity, reason in candidates:
+                                selected_reasons[identity] = reason
+                        else:
+                            selected_reasons[representative_identity] = representative[3]
+                            for _, _, identity, _ in candidates:
+                                if identity != representative_identity:
+                                    automatic_skip_reasons[identity] = (
+                                        f"Grouped with representative GET {representative_identity[1]} "
+                                        "because it has the same route shape; this endpoint was not "
+                                        "tested and its result is not inferred."
+                                    )
                     else:
-                        selected_reasons[representative_identity] = representative[3]
                         for _, _, identity, _ in candidates:
-                            if identity != representative_identity:
-                                automatic_skip_reasons[identity] = (
-                                    f"Grouped with representative GET {representative_identity[1]} "
-                                    "because it has the same route shape; this endpoint was not "
-                                    "tested and its result is not inferred."
-                                )
-                else:
-                    for _, _, identity, _ in candidates:
-                        automatic_skip_reasons[identity] = (
-                            f"Automatic selection is limited to "
-                            f"{endpoint_budget} endpoint groups per scan; "
-                            "higher-priority candidates were selected first."
-                        )
-        else:
-            selection_mode = "not_confirmed"
-            selection_budget["mode"] = selection_mode
-            auto_mode_reason = (
-                "Automatic JWT selection is disabled for this scan; enable the JWT "
-                "authentication module to select eligible discovered GET endpoints."
-            )
+                            automatic_skip_reasons[identity] = (
+                                "Automatic selection is limited to "
+                                f"{endpoint_budget} endpoint groups per scan; "
+                                "higher-priority candidates were selected first."
+                            )
 
         rate_limit_candidates = self._rate_limit_candidates(analyzed)
         bola_candidates = []
@@ -707,7 +779,7 @@ class Modules:
                     elif (endpoint.get("method") or "") not in _READ_ONLY_METHODS:
                         skip_reason = (
                             f"{endpoint.get('method') or 'Unknown'} is not enabled for JWT "
-                            "testing; only GET is supported."
+                            "testing; supported methods are GET, POST, PUT, PATCH, DELETE, HEAD, and OPTIONS."
                         )
                     elif auto_mode_reason:
                         skip_reason = auto_mode_reason
@@ -731,11 +803,11 @@ class Modules:
                     report_progress()
                     continue
 
-                if identity[0] not in _READ_ONLY_METHODS:
+                if identity[0] not in _JWT_TEST_METHODS:
                     endpoint["jwt_selected"] = False
                     endpoint["jwt_selection_reason"] = (
                         f"{identity[0] or 'Unknown'} is not enabled for JWT testing; "
-                        "only GET is supported."
+                        "supported methods are GET, POST, PUT, PATCH, DELETE, HEAD, and OPTIONS."
                     )
                     endpoint["test_results"].append(
                         self.authentication_test.skipped_result(
@@ -829,7 +901,14 @@ class Modules:
                 id(candidate[1]) for candidate in selected_rate_candidates
             }
             rate_limit_tested_count = 0
-            rate_limit_request_budget = RateLimitTest.SCAN_REQUEST_BUDGET
+            try:
+                rate_limit_request_budget = (
+                    RateLimitTest.SCAN_REQUEST_BUDGET
+                    if rate_limit_request_budget is None
+                    else max(1, min(int(rate_limit_request_budget), 1000))
+                )
+            except (TypeError, ValueError):
+                rate_limit_request_budget = RateLimitTest.SCAN_REQUEST_BUDGET
             for endpoint in analyzed:
                 identity = (
                     str(endpoint.get("method") or "").upper(),

@@ -71,6 +71,133 @@ class ScanPipelineTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
 
+    def test_security_budgets_are_forwarded_to_scan_pipeline(self):
+        with patch("app.main._run_scan_pipeline", new_callable=AsyncMock) as run_scan:
+            run_scan.return_value = (200, {"ok": True})
+
+            response = self.client.get(
+                "/scan",
+                params={
+                    "target": "http://127.0.0.1:8085",
+                    "jwt_endpoint_budget": 25,
+                    "bola_request_budget": 17,
+                    "rate_limit_request_budget": 240,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(run_scan.await_args.kwargs["jwt_endpoint_budget"], 25)
+        self.assertEqual(run_scan.await_args.kwargs["bola_request_budget"], 17)
+        self.assertEqual(run_scan.await_args.kwargs["rate_limit_request_budget"], 240)
+
+    def test_remote_kiterunner_limit_uses_builtin_default_without_custom_wordlist(self):
+        with patch("app.main._run_scan_pipeline", new_callable=AsyncMock) as run_scan:
+            run_scan.return_value = (200, {"ok": True})
+
+            response = self.client.get(
+                "/scan",
+                params={
+                    "target": "https://example.invalid",
+                    "kiterunner_limit": 5000,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(run_scan.await_args.args[1], 5000)
+
+    def test_scan_defaults_to_200_kiterunner_routes(self):
+        with patch("app.main._run_scan_pipeline", new_callable=AsyncMock) as run_scan:
+            run_scan.return_value = (200, {"ok": True})
+
+            response = self.client.get(
+                "/scan",
+                params={"target": "https://example.invalid"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(run_scan.await_args.args[1], 200)
+
+    def test_loopback_kiterunner_limit_can_be_increased(self):
+        with patch("app.main._run_scan_pipeline", new_callable=AsyncMock) as run_scan:
+            run_scan.return_value = (200, {"ok": True})
+
+            response = self.client.get(
+                "/scan",
+                params={"target": FRONTEND, "kiterunner_limit": 5000},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(run_scan.await_args.args[1], 5000)
+
+    def test_loopback_kiterunner_limit_allows_more_than_5000_routes(self):
+        with patch("app.main.wordlist_path_count", return_value=354483), patch(
+            "app.main.load_wordlist_file",
+            return_value=("".join("/route\n" for _ in range(10)), True),
+        ), patch("app.main._run_scan_pipeline", new_callable=AsyncMock) as run_scan:
+            run_scan.return_value = (200, {"ok": True})
+
+            response = self.client.get(
+                "/scan",
+                params={
+                    "target": FRONTEND,
+                    "kiterunner_limit": 10000,
+                    "wordlist_name": "api_wordlist.txt",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(run_scan.await_args.args[1], 10000)
+
+    def test_loopback_kiterunner_limit_is_capped_by_selected_wordlist(self):
+        with patch("app.main.wordlist_path_count", return_value=3), patch(
+            "app.main.load_wordlist_file",
+            return_value=("/api/users\n/api/orders\n/api/inventory", False),
+        ), patch("app.main._run_scan_pipeline", new_callable=AsyncMock) as run_scan:
+            run_scan.return_value = (200, {"ok": True})
+
+            response = self.client.get(
+                "/scan",
+                params={
+                    "target": FRONTEND,
+                    "kiterunner_limit": 5000,
+                    "wordlist_name": "routes.txt",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(run_scan.await_args.args[1], 3)
+        self.assertEqual(
+            run_scan.await_args.kwargs["kiterunner_wordlist"],
+            "/api/users\n/api/orders\n/api/inventory",
+        )
+        self.assertEqual(run_scan.await_args.kwargs["wordlist_name"], "routes.txt")
+
+    def test_remote_scan_loads_selected_custom_wordlist(self):
+        with patch("app.main.wordlist_path_count", return_value=3), patch(
+            "app.main.load_wordlist_file",
+            return_value=("/api/users\n/api/orders\n/api/inventory", False),
+        ) as load, patch(
+            "app.main._run_scan_pipeline", new_callable=AsyncMock
+        ) as run_scan:
+            run_scan.return_value = (200, {"ok": True})
+
+            response = self.client.get(
+                "/scan",
+                params={
+                    "target": "https://example.invalid",
+                    "kiterunner_limit": 5000,
+                    "wordlist_name": "routes.txt",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(run_scan.await_args.args[1], 3)
+        self.assertEqual(
+            run_scan.await_args.kwargs["kiterunner_wordlist"],
+            "/api/users\n/api/orders\n/api/inventory",
+        )
+        load.assert_called_once_with("routes.txt", 3)
+
     @patch.dict(
         os.environ,
         {"MICROSCAN_GATEWAY_TARGET": "http://localhost:8085"},
@@ -95,7 +222,7 @@ class ScanPipelineTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["target"], target)
-            self.assertEqual(kiterunner.call_args, call(target, 1000))
+            self.assertEqual(kiterunner.call_args, call(target, 200))
             self.assertEqual(file_scan.await_args.args[0], target)
             self.assertEqual(file_scan.await_args.kwargs["gateway_target"], target)
             self.assertEqual(security_modules.call_args.args[0], target)
@@ -116,7 +243,7 @@ class ScanPipelineTests(unittest.TestCase):
             response = self.client.get("/scan", params={"target": target})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(discovery.call_args, call(target, 1000))
+        self.assertEqual(discovery.call_args, call(target, 200))
         self.assertEqual(file_scan.await_args.args[0], target)
         self.assertEqual(file_scan.await_args.kwargs["gateway_target"], "")
         self.assertEqual(response.json()["target"], target)
@@ -336,7 +463,7 @@ class ScanPipelineTests(unittest.TestCase):
             response = self.client.get("/scan", params={"target": FRONTEND})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(kiterunner.call_args_list[0], call(FRONTEND, 1000))
+        self.assertEqual(kiterunner.call_args_list[0], call(FRONTEND, 200))
         self.assertEqual(kiterunner.call_count, 1)
         self.assertEqual(seeded_kiterunner.call_count, 2)
         self.assertEqual(
@@ -1432,7 +1559,7 @@ class ScanPipelineTests(unittest.TestCase):
             response = self.client.get("/scan", params={"target": FRONTEND})
 
         self.assertEqual(response.status_code, 200)
-        discovery.assert_called_once_with(FRONTEND, 1000)
+        discovery.assert_called_once_with(FRONTEND, 200)
         file_scan.assert_awaited_once()
         seeded_scan.assert_not_called()
         stage = next(
@@ -1610,10 +1737,10 @@ class ScanPipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(initial_scan.call_args_list[0], call(FRONTEND, 1000))
+        self.assertEqual(initial_scan.call_args_list[0], call(FRONTEND, 200))
         self.assertEqual(
             initial_scan.call_args_list[1],
-            call(SECONDARY_ORIGIN, 1000, True, 45),
+            call(SECONDARY_ORIGIN, 200, True, 45),
         )
         self.assertEqual(file_scan.await_args.kwargs["gateway_target"], FRONTEND)
         self.assertEqual(seeded_scan.call_count, 2)
@@ -1716,10 +1843,10 @@ class ScanPipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(initial_scan.call_args_list[0], call(target, 1000))
+        self.assertEqual(initial_scan.call_args_list[0], call(target, 200))
         self.assertEqual(
             initial_scan.call_args_list[1],
-            call(external, 1000, True, 45),
+            call(external, 200, True, 45),
         )
         seeded_scan.assert_called_once_with(external, ["/api/orders"], 100)
         self.assertEqual(

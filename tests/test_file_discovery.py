@@ -1,14 +1,20 @@
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
 
 from app.main import app
 from discovery.file_discovery import (
+    DEFAULT_WORDLIST_FILE,
     FileDiscovery,
+    _wordlist_entries,
+    available_wordlists,
     extract_javascript_endpoints,
     extract_script_urls,
+    load_wordlist_file,
     normalize_origin,
 )
 
@@ -18,6 +24,61 @@ GATEWAY = "http://localhost:8085/"
 
 
 class FileDiscoveryTests(unittest.TestCase):
+    def test_available_wordlists_include_new_text_files_and_http_archive_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wordlist_dir = Path(directory)
+            (wordlist_dir / "api_wordlist.txt").write_text("/api/users\n", encoding="utf-8")
+            (
+                wordlist_dir / "httparchive_apiroutes_2026_02_27.txt"
+            ).write_text("/api/orders\n/api/inventory\n", encoding="utf-8")
+            (wordlist_dir / "extra_routes.txt").write_text("/api/items\n", encoding="utf-8")
+            (wordlist_dir / "ignored.csv").write_text("ignored", encoding="utf-8")
+
+            with patch("discovery.file_discovery.WORDLIST_DIRECTORY", wordlist_dir):
+                wordlists = available_wordlists()
+
+        self.assertEqual(
+            DEFAULT_WORDLIST_FILE,
+            "httparchive_apiroutes_2026_02_27.txt",
+        )
+        self.assertEqual(
+            {item["id"] for item in wordlists},
+            {
+                "api_wordlist.txt",
+                "extra_routes.txt",
+                "httparchive_apiroutes_2026_02_27.txt",
+            },
+        )
+        self.assertEqual(
+            {item["id"]: item["line_count"] for item in wordlists},
+            {
+                "api_wordlist.txt": 1,
+                "extra_routes.txt": 1,
+                "httparchive_apiroutes_2026_02_27.txt": 2,
+            },
+        )
+
+    def test_large_wordlist_is_bounded_by_selected_path_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wordlist_dir = Path(directory)
+            (wordlist_dir / "routes.txt").write_text(
+                "/api/one\n/api/two\n/api/three\n",
+                encoding="utf-8",
+            )
+            with patch("discovery.file_discovery.WORDLIST_DIRECTORY", wordlist_dir):
+                wordlist, truncated = load_wordlist_file("routes.txt", 2)
+
+        self.assertEqual(len(_wordlist_entries(wordlist, 2)), 2)
+        self.assertTrue(truncated)
+
+    def test_wordlist_file_loader_rejects_unknown_file_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch(
+                "discovery.file_discovery.WORDLIST_DIRECTORY",
+                Path(directory),
+            ), self.assertRaises(ValueError):
+                load_wordlist_file("../secrets.txt", 10)
+
     def test_script_urls_support_absolute_root_relative_and_relative_paths(self):
         html = """
         <script src="/assets/root.js"></script>
@@ -696,6 +757,47 @@ class FileDiscoveryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         scan.assert_awaited_once()
         self.assertFalse(scan.await_args.kwargs["verify_endpoints"])
+
+    def test_wordlist_catalog_api_exposes_default_and_dynamic_files(self):
+        catalog = [
+            {"id": "api_wordlist.txt", "name": "API Routes", "line_count": 1},
+            {
+                "id": "httparchive_apiroutes_2026_02_27.txt",
+                "name": "HTTP Archive API Routes",
+                "line_count": 354483,
+            },
+        ]
+        with patch("app.main.available_wordlists", return_value=catalog):
+            from fastapi.testclient import TestClient
+
+            response = TestClient(app).get("/file-discovery/wordlists")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["default"], DEFAULT_WORDLIST_FILE)
+        self.assertEqual(response.json()["wordlists"], catalog)
+
+    def test_api_passes_selected_wordlist_and_limit_to_file_discovery(self):
+        with patch(
+            "app.main.load_wordlist_file",
+            return_value=("one\ntwo", True),
+        ), patch("app.main.FileDiscovery.scan", new_callable=AsyncMock) as scan:
+            scan.return_value = {"results": [], "summary": {}}
+            from fastapi.testclient import TestClient
+
+            response = TestClient(app).post(
+                "/file-discovery",
+                json={
+                    "target": FRONTEND,
+                    "wordlist_name": "api_wordlist.txt",
+                    "wordlist_limit": 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(scan.await_args.kwargs["wordlist"], "one\ntwo")
+        self.assertEqual(scan.await_args.kwargs["wordlist_limit"], 2)
+        self.assertTrue(response.json()["summary"]["wordlist_truncated"])
+
 
 
 if __name__ == "__main__":

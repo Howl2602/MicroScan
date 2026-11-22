@@ -1,14 +1,15 @@
 import { Box, Card, CardContent, Chip, Link, Typography } from '@mui/material'
 
 const sections = [
-  ['api-security', 'API Security'],
-  ['authentication-jwt', 'Broken Authentication / JWT'],
+  ['api-security', 'Tổng quan API Security'],
+  ['authentication-jwt', 'Xác thực JWT'],
   ['bola', 'BOLA'],
-  ['rate-limiting', 'Rate Limiting'],
+  ['rate-limiting', 'Giới hạn tốc độ'],
   ['gateway-bypass', 'Gateway Bypass'],
-  ['reading-results', 'How to Read Results'],
-  ['glossary', 'Glossary'],
-  ['references', 'References'],
+  ['settings-guide', 'Hướng dẫn Settings'],
+  ['reading-results', 'Cách đọc kết quả'],
+  ['glossary', 'Thuật ngữ'],
+  ['references', 'Tài liệu tham khảo'],
 ]
 
 const glossaryGroups = [
@@ -246,6 +247,21 @@ export default function IntroductionPage() {
           backend hoặc endpoint đều có thể truy cập trực tiếp. Gateway Bypass không được trình bày ở đây như một mục riêng
           của OWASP API Security Top 10 2023.
         </Typography>
+      </SectionCard>
+
+      <SectionCard id="settings-guide" title="G. Hướng dẫn Settings">
+        <Typography color="text.secondary" sx={{ mb: 1.5 }}>
+          Các cài đặt Settings giúp kiểm soát mức độ bao phủ và số lượng request của từng module.
+          Các giá trị này là giới hạn quét, không thay đổi phạm vi được phép hoặc làm cho mục tiêu an toàn hơn.
+        </Typography>
+        <BulletList items={[
+          'JWT / Authentication: JWT endpoint budget giới hạn số nhóm endpoint được ưu tiên trong Standard Scan. Endpoint allowlist có thể giới hạn thử nghiệm theo phương thức và đường dẫn chính xác. Full Scan không bị giới hạn bởi budget này.',
+          'BOLA: active request budget giới hạn số request bổ sung dùng để kiểm tra quan hệ đối tượng. Kết quả thụ động chỉ là tương quan bằng chứng, chưa tự chứng minh lỗ hổng.',
+          'Rate Limit: maximum requests per scan giới hạn tổng burst và baseline request gửi đến các endpoint đủ điều kiện. Việc không gặp HTTP 429 trong giới hạn thử nghiệm không chứng minh hệ thống không có giới hạn.',
+          'Gateway Bypass: khoảng cổng chỉ áp dụng cho Quét tiêu chuẩn. Quét đầy đủ quét cổng 1-65.535. Hãy chọn khoảng nhỏ, đặt trong phạm vi được phép và hiểu rằng quét nhiều cổng có thể làm scan lâu hơn.',
+          'API Discovery: File Discovery giới hạn số đường dẫn trong wordlist và số request/lưu lượng; Kiterunner mặc định quét 200 route và có thể giới hạn theo số route trong wordlist đang chọn. Thêm hoặc sửa file .txt trong discovery/wordlist rồi nhấn Refresh wordlists.',
+          'Chỉ quét mục tiêu mà tổ chức đã cấp phép. Settings không thay đổi authorized scope hoặc quyền kiểm thử.',
+        ]} />
       </SectionCard>
 
       <SectionCard id="reading-results" title="F. How to Read Results - Cách đọc kết quả MicroScan">

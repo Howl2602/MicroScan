@@ -3,10 +3,12 @@ import hashlib
 import html
 import ipaddress
 import inspect
+import math
 import re
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -27,12 +29,16 @@ DEFAULT_WORDLIST = (
     "config.bak\n"
     ".env.bak"
 )
-MAX_WORDLIST_ENTRIES = 100
+WORDLIST_DIRECTORY = Path(__file__).resolve().parent / "wordlist"
+DEFAULT_WORDLIST_FILE = "httparchive_apiroutes_2026_02_27.txt"
+DEFAULT_WORDLIST_LIMIT = 100
+MAX_WORDLIST_ENTRIES = 1000
 MAX_BODY_BYTES = 1024 * 1024
 MAX_SCRIPTS = 10
 MAX_JS_ENDPOINTS = 100
 MAX_HTML_ENDPOINTS = 100
 MAX_EXECUTION_SECONDS = 60
+MAX_CONFIGURABLE_EXECUTION_SECONDS = 300
 MAX_EVIDENCE_CHARS = 180
 MAX_KITERUNNER_SEEDS = 20
 
@@ -448,7 +454,65 @@ def extract_html_endpoints(page_url: str, document: str) -> list[dict]:
     return list(endpoints.values())
 
 
-def _wordlist_entries(wordlist: str | None) -> list[str]:
+def available_wordlists() -> list[dict[str, str | int]]:
+    wordlists = []
+    for path in sorted(WORDLIST_DIRECTORY.glob("*.txt")):
+        if path.is_file() and path.resolve().parent == WORDLIST_DIRECTORY.resolve():
+            display_name = {
+                "api_wordlist.txt": "API Routes",
+                "httparchive_apiroutes_2026_02_27.txt": "HTTP Archive API Routes",
+            }.get(path.name, path.stem.replace("_", " "))
+            with path.open(encoding="utf-8", errors="replace") as wordlist_file:
+                line_count = sum(
+                    1 for line in wordlist_file
+                    if line.strip() and not line.lstrip().startswith("#")
+                )
+            wordlists.append(
+                {"id": path.name, "name": display_name, "line_count": line_count}
+            )
+    return wordlists
+
+
+def _wordlist_file_path(name: str) -> Path:
+    if not name or Path(name).name != name or Path(name).suffix.lower() != ".txt":
+        raise ValueError(f"Invalid wordlist name: {name}")
+    path = (WORDLIST_DIRECTORY / name).resolve()
+    if path.parent != WORDLIST_DIRECTORY.resolve() or not path.is_file():
+        raise ValueError(f"Unknown wordlist: {name}")
+    return path
+
+
+def wordlist_path_count(name: str) -> int:
+    if name == "builtin":
+        return len(_wordlist_entries(DEFAULT_WORDLIST, MAX_WORDLIST_ENTRIES))
+    path = _wordlist_file_path(name)
+    with path.open(encoding="utf-8", errors="replace") as wordlist_file:
+        return sum(
+            1 for line in wordlist_file
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+
+
+def load_wordlist_file(name: str, limit: int) -> tuple[str, bool]:
+    if name == "builtin":
+        return DEFAULT_WORDLIST, False
+    path = _wordlist_file_path(name)
+
+    entries = []
+    truncated = False
+    with path.open(encoding="utf-8", errors="replace") as wordlist_file:
+        for line in wordlist_file:
+            path_entry = line.strip()
+            if not path_entry or path_entry.startswith("#"):
+                continue
+            if len(entries) >= limit:
+                truncated = True
+                break
+            entries.append(path_entry)
+    return "\n".join(entries), truncated
+
+
+def _wordlist_entries(wordlist: str | None, limit=DEFAULT_WORDLIST_LIMIT) -> list[str]:
     values = wordlist if wordlist is not None else DEFAULT_WORDLIST
     entries = []
     for line in values.splitlines():
@@ -458,8 +522,8 @@ def _wordlist_entries(wordlist: str | None) -> list[str]:
         if "?" in path or "#" in path or "\\" in path:
             raise ValueError("Wordlist entries must be plain paths without queries or fragments.")
         entries.append(path)
-        if len(entries) > MAX_WORDLIST_ENTRIES:
-            raise ValueError(f"Wordlists are limited to {MAX_WORDLIST_ENTRIES} paths.")
+        if len(entries) > limit:
+            raise ValueError(f"Wordlists are limited to {limit} paths.")
     return list(dict.fromkeys(entries))
 
 
@@ -532,12 +596,14 @@ class FileDiscovery:
         verify_endpoints: bool = False,
         gateway_target: str | None = None,
         progress_callback=None,
+        wordlist_limit: int = DEFAULT_WORDLIST_LIMIT,
     ) -> dict:
         page_url = normalize_origin(target)
-        entries = _wordlist_entries(wordlist)
+        wordlist_limit = min(max(int(wordlist_limit), 1), MAX_WORDLIST_ENTRIES)
         rate = min(max(float(requests_per_second), 0.5), 5)
         timeout = min(max(float(timeout), 1), 15)
         concurrency = min(max(int(concurrency), 1), 5)
+        entries = _wordlist_entries(wordlist, wordlist_limit)
         if verify_endpoints and not gateway_target:
             raise ValueError("A Gateway target is required when endpoint verification is enabled.")
         gateway_origin = normalize_origin(gateway_target) if verify_endpoints and gateway_target else None
@@ -553,7 +619,13 @@ class FileDiscovery:
             semaphore = asyncio.Semaphore(concurrency)
             request_lock = asyncio.Lock()
             next_request = [0.0]
-            deadline = time.monotonic() + MAX_EXECUTION_SECONDS
+            execution_limit_seconds = MAX_EXECUTION_SECONDS
+            if wordlist_limit > DEFAULT_WORDLIST_LIMIT:
+                execution_limit_seconds = min(
+                    MAX_CONFIGURABLE_EXECUTION_SECONDS,
+                    max(MAX_EXECUTION_SECONDS, math.ceil(wordlist_limit / rate) + 10),
+                )
+            deadline = time.monotonic() + execution_limit_seconds
             requests_made = [0]
             requests_failed = [0]
             execution_limited = [False]
@@ -901,7 +973,7 @@ class FileDiscovery:
                 "concurrency_limit": concurrency,
                 "requests_made": requests_made[0],
                 "requests_failed": requests_failed[0],
-                "execution_time_limit_seconds": MAX_EXECUTION_SECONDS,
+                "execution_time_limit_seconds": execution_limit_seconds,
                 "execution_time_limited": execution_limited[0],
                 "javascript_endpoint_limit": MAX_JS_ENDPOINTS,
             },

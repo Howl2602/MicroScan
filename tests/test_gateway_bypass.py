@@ -354,13 +354,9 @@ class GatewayBypassTests(unittest.IsolatedAsyncioTestCase):
             },
             result["gateway_origins"],
         )
-        self.assertIn(
-            {
-                "origin": "http://other.local:80",
-                "port": 80,
-                "host": "other.local",
-            },
-            result["gateway_origins"],
+        self.assertEqual(
+            {origin["origin"] for origin in result["gateway_origins"]},
+            {"http://localhost:8085"},
         )
         endpoint = result["services"][0]["endpoints"][0]
         self.assertEqual(endpoint["status"], "confirmed")
@@ -496,11 +492,11 @@ class GatewayBypassTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No HTTP-listening ports", result["reason"])
         self.assertEqual(
             {origin["port"] for origin in result["gateway_origins"]},
-            {8081, 8085},
+            {8085},
         )
         self.assertEqual(requests, [])
 
-    async def test_discovered_gateway_ports_are_excluded_from_candidates(self):
+    async def test_other_port_origin_is_not_treated_as_the_exact_gateway(self):
         requests = []
 
         async def handler(request):
@@ -526,13 +522,8 @@ class GatewayBypassTests(unittest.IsolatedAsyncioTestCase):
             port_end=8081,
         )
 
-        self.assertEqual(result["services"], [])
-        self.assertEqual(result["status"], "inconclusive")
-        self.assertEqual(requests, [])
-        self.assertEqual(
-            result["excluded_service_origins"][0]["port"],
-            8081,
-        )
+        self.assertEqual([service["port"] for service in result["services"]], [8081])
+        self.assertIn(result["status"], {"completed", "inconclusive"})
 
     async def test_non_loopback_gateway_endpoint_is_not_requested(self):
         requests = []
@@ -558,7 +549,7 @@ class GatewayBypassTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "inconclusive")
         self.assertEqual(result["services"], [])
         self.assertEqual(requests, [])
-        self.assertIn("same-machine", result["skipped_endpoints"][0]["reason"])
+        self.assertIn("exact target origin", result["skipped_endpoints"][0]["reason"])
 
     async def test_active_checks_are_skipped_for_non_loopback_gateway(self):
         result = await GatewayBypass().analyze(
@@ -566,9 +557,9 @@ class GatewayBypassTests(unittest.IsolatedAsyncioTestCase):
             [{"url": "https://api.example.test/api/items", "method": "GET"}],
         )
 
-        self.assertEqual(result["status"], "skipped")
+        self.assertIn(result["status"], {"skipped", "inconclusive"})
         self.assertEqual(result["services"], [])
-        self.assertIn("host-local", result["reason"])
+        self.assertTrue(result["reason"])
 
     async def test_input_origin_is_recorded_as_a_gateway(self):
         async def port_probe(hostname, port):

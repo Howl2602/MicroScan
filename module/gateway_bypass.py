@@ -91,10 +91,8 @@ class GatewayBypass:
     @classmethod
     def _gateway_origin(cls, target):
         origin = cls._origin_parts(target)
-        if origin is None or not cls._is_loopback(origin["hostname"]):
-            raise ValueError(
-                "Gateway Bypass active checks are limited to host-local gateway targets."
-            )
+        if origin is None:
+            raise ValueError("Gateway Bypass requires an exact HTTP(S) target origin.")
         return origin
 
     @staticmethod
@@ -220,22 +218,23 @@ class GatewayBypass:
                     route_parts = None
             if route_parts is None:
                 continue
-
-            gateway_origins.setdefault(route_parts["identity"], route_parts)
-            endpoints_by_gateway.setdefault(route_parts["identity"], [])
-
-            if not cls._is_loopback(route_parts["hostname"]):
+            if (
+                target_parts is None
+                or route_parts["identity"] != target_parts["identity"]
+            ):
                 skipped_endpoints.append(
                     {
                         "method": str(item.get("method") or "UNKNOWN").upper(),
                         "path": route_path,
                         "reason": (
                             "Active Gateway and service checks are limited to "
-                            "same-machine origins."
+                            "the exact target origin."
                         ),
                     }
                 )
                 continue
+            gateway_origins.setdefault(route_parts["identity"], route_parts)
+            endpoints_by_gateway.setdefault(route_parts["identity"], [])
 
             method = str(item.get("method") or "").upper()
             path = route_path
@@ -606,12 +605,12 @@ class GatewayBypass:
             key=lambda item: (item["host"], item["port"], item["origin"]),
         )
         excluded_service_origins = []
-        loopback_gateways = [
+        exact_origin_gateways = [
             gateway
             for gateway in gateway_origins.values()
-            if self._is_loopback(gateway["hostname"])
+            if gateway["identity"] == gateway_origin["identity"]
         ]
-        if not loopback_gateways:
+        if not exact_origin_gateways:
             return {
                 "status": "inconclusive",
                 "reason": "Discovery did not provide local Gateway origins to compare.",
@@ -627,7 +626,7 @@ class GatewayBypass:
             }
 
         endpoint_groups = {}
-        for gateway in loopback_gateways:
+        for gateway in exact_origin_gateways:
             gateway_endpoints = endpoints_by_gateway.get(gateway["identity"], [])
             if not gateway_endpoints:
                 continue
@@ -726,7 +725,7 @@ class GatewayBypass:
 
         candidate_services = {}
         excluded_port_set = {
-            gateway["port"] for gateway in loopback_gateways
+            gateway["port"] for gateway in exact_origin_gateways
         }
         ports_to_probe = [
             port for port in candidate_port_range if port not in excluded_port_set

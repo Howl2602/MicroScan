@@ -27,7 +27,6 @@ class LoginConfigurationError(LoginError):
 
 class Signin:
     TIMEOUT_SECONDS = 8
-    MAX_LOGIN_CANDIDATES = 3
     TOKEN_FIELDS = ("access_token", "accessToken", "token", "jwt")
     USERNAME_FIELDS = {"email", "login", "user", "username"}
     PASSWORD_FIELDS = {"pass", "passwd", "password"}
