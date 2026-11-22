@@ -669,9 +669,30 @@ class FileDiscovery:
             endpoints = {}
             page_sources = []
 
-            if analyze_javascript and baseline.content_type and (
+            is_html_document = baseline.content_type and (
                 "html" in baseline.content_type or baseline.body.lstrip().startswith(b"<")
+            )
+            if (
+                is_html_document
+                and baseline.status_code
+                and 200 <= baseline.status_code < 300
             ):
+                endpoints[("GET", page_url)] = {
+                    "url": page_url,
+                    "discovered_url": page_url,
+                    "method": "GET",
+                    "is_api_endpoint": False,
+                    "classification": "frontend_page",
+                    "sources": ["html"],
+                    "verification_status": "verified",
+                    "status_code": baseline.status_code,
+                    "content_type": baseline.content_type,
+                    "size": baseline.size,
+                    "response_time_ms": round(baseline.elapsed_ms, 2),
+                    "evidence": [],
+                }
+
+            if analyze_javascript and is_html_document:
                 await self._notify(progress_callback, "JavaScript Analysis", "running")
                 page_sources.append(page_url)
                 document = baseline.body.decode("utf-8", errors="replace")

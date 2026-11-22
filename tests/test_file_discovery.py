@@ -199,6 +199,11 @@ class FileDiscoveryTests(unittest.TestCase):
         )
 
         records = {(item["method"], httpx.URL(item["url"]).path): item for item in result["results"]}
+        root = records[("GET", "/")]
+        self.assertEqual(root["classification"], "frontend_page")
+        self.assertFalse(root["is_api_endpoint"])
+        self.assertEqual(root["verification_status"], "verified")
+        self.assertEqual(root["sources"], ["html"])
         self.assertEqual(records[("GET", "/api/items")]["sources"], ["html"])
         self.assertEqual(records[("POST", "/api/login")]["verification_status"], "discovered")
         self.assertTrue(records[("POST", "/api/login")]["is_api_endpoint"])
@@ -314,7 +319,11 @@ class FileDiscoveryTests(unittest.TestCase):
             )
         )
 
-        html_route = next(item for item in result["results"] if "html" in item["sources"])
+        html_route = next(
+            item
+            for item in result["results"]
+            if item.get("classification") == "frontend_route"
+        )
         api_call = next(
             item for item in result["results"]
             if item.get("discovered_url") == "/api/orders"

@@ -77,6 +77,9 @@ class KiteRunner:
             if not isinstance(data, dict):
                 continue
 
+            if data.get("message") == "scan options":
+                continue
+
             route = data.get("path") or data.get("target")
             if not route:
                 continue

@@ -259,7 +259,7 @@ export default function IntroductionPage() {
           'BOLA: active request budget giới hạn số request bổ sung dùng để kiểm tra quan hệ đối tượng. Kết quả thụ động chỉ là tương quan bằng chứng, chưa tự chứng minh lỗ hổng.',
           'Rate Limit: maximum requests per scan giới hạn tổng burst và baseline request gửi đến các endpoint đủ điều kiện. Việc không gặp HTTP 429 trong giới hạn thử nghiệm không chứng minh hệ thống không có giới hạn.',
           'Gateway Bypass: khoảng cổng chỉ áp dụng cho Quét tiêu chuẩn. Quét đầy đủ quét cổng 1-65.535. Hãy chọn khoảng nhỏ, đặt trong phạm vi được phép và hiểu rằng quét nhiều cổng có thể làm scan lâu hơn.',
-          'API Discovery: File Discovery giới hạn số đường dẫn trong wordlist và số request/lưu lượng; Kiterunner mặc định quét 200 route và có thể giới hạn theo số route trong wordlist đang chọn. Thêm hoặc sửa file .txt trong discovery/wordlist rồi nhấn Refresh wordlists.',
+          'API Discovery: File Discovery giới hạn số đường dẫn trong wordlist và số request/lưu lượng; Kiterunner mặc định quét 200 route và có thể giới hạn theo số route trong wordlist đang chọn. Khi target loopback có API origin khác được tìm thấy, origin target được quét bằng route tích hợp sẵn của Kiterunner; wordlist Settings vẫn được dùng cho API origin. Thêm hoặc sửa file .txt trong discovery/wordlist rồi nhấn Refresh wordlists.',
           'Chỉ quét mục tiêu mà tổ chức đã cấp phép. Settings không thay đổi authorized scope hoặc quyền kiểm thử.',
         ]} />
       </SectionCard>

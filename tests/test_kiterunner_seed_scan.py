@@ -75,6 +75,25 @@ class KiterunnerSeedScanTests(unittest.TestCase):
             "localhost:9000",
         )
 
+    def test_json_parser_ignores_scan_options_metadata_record(self):
+        output = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "level": "info",
+                        "target": "http://localhost:3000",
+                        "message": "scan options",
+                    }
+                ),
+                json.dumps({"method": "GET", "path": "/api/orders"}),
+            ]
+        )
+
+        self.assertEqual(
+            KiteRunner()._parse_json_lines(output),
+            [{"method": "GET", "path": "/api/orders"}],
+        )
+
     @patch("discovery.kiterunner.subprocess.run")
     def test_regular_scan_passes_kiterunner_host_without_url_scheme(self, run):
         run.return_value = subprocess.CompletedProcess(

@@ -334,7 +334,7 @@ class ScanPipelineTests(unittest.TestCase):
             [FRONTEND, SECONDARY_ORIGIN],
         )
 
-    def test_custom_wordlist_skips_frontend_when_an_api_origin_is_discovered(self):
+    def test_custom_wordlist_uses_embedded_routes_for_frontend_and_selected_list_for_api(self):
         wordlist = "/api/orders\n/api/inventory"
         file_result = {
             "results": [
@@ -360,12 +360,15 @@ class ScanPipelineTests(unittest.TestCase):
             return_value=(wordlist, False),
         ), patch(
             "app.main.Discovery.discover",
-            return_value={
-                "target": SECONDARY_ORIGIN,
-                "results": [],
-                "exit_code": 0,
-                "result_count": 0,
-            },
+            side_effect=[
+                [],
+                {
+                    "target": SECONDARY_ORIGIN,
+                    "results": [],
+                    "exit_code": 0,
+                    "result_count": 0,
+                },
+            ],
         ) as discovery, patch(
             "app.main.FileDiscovery.scan",
             new_callable=AsyncMock,
@@ -395,19 +398,29 @@ class ScanPipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        discovery.assert_called_once_with(
-            SECONDARY_ORIGIN,
-            2,
-            True,
-            45,
-            wordlist=wordlist,
+        self.assertEqual(len(discovery.call_args_list), 2)
+        self.assertEqual(
+            discovery.call_args_list[0].args,
+            (FRONTEND, 2),
+        )
+        self.assertEqual(
+            discovery.call_args_list[0].kwargs,
+            {},
+        )
+        self.assertEqual(
+            discovery.call_args_list[1].args,
+            (SECONDARY_ORIGIN, 2, True, 45),
+        )
+        self.assertEqual(
+            discovery.call_args_list[1].kwargs,
+            {"wordlist": wordlist},
         )
         stages = {
             event["stage"]: event
             for event in response.json()["discovery_stages"]
         }
-        self.assertEqual(stages["API Discovery"]["status"], "skipped")
-        self.assertIn(SECONDARY_ORIGIN, stages["API Discovery"]["detail"])
+        self.assertEqual(stages["API Discovery"]["status"], "completed")
+        self.assertIn("built-in Assetnote routes", stages["API Discovery"]["detail"])
         self.assertEqual(
             stages["API Origin Discovery Round 1"]["status"],
             "completed",
