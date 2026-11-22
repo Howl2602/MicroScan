@@ -1674,44 +1674,6 @@ async def _run_scan_pipeline(
     await emit("API Discovery", "running")
     kiterunner_results = []
     kiterunner_error = None
-    try:
-        if kiterunner_wordlist is None:
-            kiterunner_results = await asyncio.to_thread(
-                Discovery().discover, discovery_target, num
-            )
-        else:
-            kiterunner_results = await asyncio.to_thread(
-                Discovery().discover,
-                discovery_target,
-                num,
-                wordlist=kiterunner_wordlist,
-            )
-        await emit(
-            "API Discovery",
-            "completed",
-            (
-                f"Kiterunner discovered {len(kiterunner_results)} endpoint(s)"
-                + (
-                    f" using {wordlist_name} (up to {num} entries)."
-                    if kiterunner_wordlist is not None
-                    else "."
-                )
-            ),
-        )
-    except (ValueError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
-        kiterunner_error = str(exc)
-        logger.warning("API Discovery failed | error=%s", type(exc).__name__)
-        await emit("API Discovery", "error", kiterunner_error)
-    except Exception as exc:
-        kiterunner_error = f"Kiterunner failed with {type(exc).__name__}."
-        logger.exception("API Discovery failed | error=%s", type(exc).__name__)
-        await emit("API Discovery", "error", kiterunner_error)
-    for endpoint in kiterunner_results:
-        if not isinstance(endpoint, dict) or endpoint.get("resolved_url"):
-            continue
-        path = _route_path(endpoint.get("path") or endpoint.get("target"), normalized_target)
-        if path:
-            endpoint["resolved_url"] = f"{normalized_target.rstrip('/')}{path}"
 
     await emit("File Discovery", "running")
     file_result = {"results": [], "summary": {}}
@@ -1781,12 +1743,68 @@ async def _run_scan_pipeline(
             }
         )
 
+    discovered_origins = _authorized_discovered_origins(
+        file_result, authorized_origins
+    )
+    base_origin = _normalized_scope_origin(discovery_target)
+    alternate_origins = sorted(discovered_origins - {base_origin})
+    if (
+        kiterunner_wordlist is not None
+        and Signin.is_loopback_target(discovery_target)
+        and alternate_origins
+    ):
+        detail = (
+            "Skipped the custom Kiterunner scan on the input origin because "
+            "File Discovery found other authorized origin(s): "
+            f"{', '.join(alternate_origins)}. Kiterunner will scan those origins instead."
+        )
+        await emit("API Discovery", "skipped", detail)
+    else:
+        try:
+            if kiterunner_wordlist is None:
+                kiterunner_results = await asyncio.to_thread(
+                    Discovery().discover, discovery_target, num
+                )
+            else:
+                kiterunner_results = await asyncio.to_thread(
+                    Discovery().discover,
+                    discovery_target,
+                    num,
+                    wordlist=kiterunner_wordlist,
+                )
+            await emit(
+                "API Discovery",
+                "completed",
+                (
+                    f"Kiterunner discovered {len(kiterunner_results)} endpoint(s)"
+                    + (
+                        f" using {wordlist_name} (up to {num} entries)."
+                        if kiterunner_wordlist is not None
+                        else "."
+                    )
+                ),
+            )
+        except (ValueError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
+            kiterunner_error = str(exc)
+            logger.warning("API Discovery failed | error=%s", type(exc).__name__)
+            await emit("API Discovery", "error", kiterunner_error)
+        except Exception as exc:
+            kiterunner_error = f"Kiterunner failed with {type(exc).__name__}."
+            logger.exception("API Discovery failed | error=%s", type(exc).__name__)
+            await emit("API Discovery", "error", kiterunner_error)
+
+    for endpoint in kiterunner_results:
+        if not isinstance(endpoint, dict) or endpoint.get("resolved_url"):
+            continue
+        path = _route_path(endpoint.get("path") or endpoint.get("target"), normalized_target)
+        if path:
+            endpoint["resolved_url"] = f"{normalized_target.rstrip('/')}{path}"
+
     limits = DISCOVERY_LIMITS
     origin_discovery_rounds = []
     visited_discovery_origins = {_normalized_scope_origin(discovery_target)}
     pending_origins = sorted(
-        _authorized_discovered_origins(file_result, authorized_origins)
-        - visited_discovery_origins
+        discovered_origins - visited_discovery_origins
     )
     while pending_origins:
         origin = pending_origins.pop(0)

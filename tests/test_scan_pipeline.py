@@ -334,6 +334,130 @@ class ScanPipelineTests(unittest.TestCase):
             [FRONTEND, SECONDARY_ORIGIN],
         )
 
+    def test_custom_wordlist_skips_frontend_when_an_api_origin_is_discovered(self):
+        wordlist = "/api/orders\n/api/inventory"
+        file_result = {
+            "results": [
+                {
+                    "url": f"{SECONDARY_ORIGIN}/api/orders",
+                    "resolved_url": f"{SECONDARY_ORIGIN}/api/orders",
+                    "method": "GET",
+                    "is_api_endpoint": True,
+                    "sources": ["javascript"],
+                    "evidence": [
+                        {
+                            "source_url": f"{FRONTEND}/assets/app.js",
+                            "snippet": "const API_BASE = 'http://localhost:8085'",
+                        }
+                    ],
+                }
+            ],
+            "page_sources": [FRONTEND],
+            "summary": {},
+        }
+        with patch("app.main.wordlist_path_count", return_value=2), patch(
+            "app.main.load_wordlist_file",
+            return_value=(wordlist, False),
+        ), patch(
+            "app.main.Discovery.discover",
+            return_value={
+                "target": SECONDARY_ORIGIN,
+                "results": [],
+                "exit_code": 0,
+                "result_count": 0,
+            },
+        ) as discovery, patch(
+            "app.main.FileDiscovery.scan",
+            new_callable=AsyncMock,
+            return_value=file_result,
+        ), patch(
+            "app.main.Discovery.discover_seeded",
+            return_value={"results": [], "exit_code": 0, "result_count": 0},
+        ), patch(
+            "app.main.Modules.analyze_endpoints",
+            return_value=[],
+        ), patch(
+            "app.main.GatewayBypass.analyze",
+            new_callable=AsyncMock,
+            return_value={
+                "status": "inconclusive",
+                "services": [],
+                "reason": "No service was found in the test.",
+            },
+        ):
+            response = self.client.get(
+                "/scan",
+                params={
+                    "target": FRONTEND,
+                    "kiterunner_limit": 2,
+                    "wordlist_name": "routes.txt",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        discovery.assert_called_once_with(
+            SECONDARY_ORIGIN,
+            2,
+            True,
+            45,
+            wordlist=wordlist,
+        )
+        stages = {
+            event["stage"]: event
+            for event in response.json()["discovery_stages"]
+        }
+        self.assertEqual(stages["API Discovery"]["status"], "skipped")
+        self.assertIn(SECONDARY_ORIGIN, stages["API Discovery"]["detail"])
+        self.assertEqual(
+            stages["API Origin Discovery Round 1"]["status"],
+            "completed",
+        )
+
+    def test_custom_wordlist_scans_direct_api_target_when_no_other_origin_is_found(self):
+        wordlist = "/api/orders\n/api/inventory"
+        with patch("app.main.wordlist_path_count", return_value=2), patch(
+            "app.main.load_wordlist_file",
+            return_value=(wordlist, False),
+        ), patch(
+            "app.main.Discovery.discover",
+            return_value=[],
+        ) as discovery, patch(
+            "app.main.FileDiscovery.scan",
+            new_callable=AsyncMock,
+            return_value={"results": [], "page_sources": [], "summary": {}},
+        ), patch(
+            "app.main.Modules.analyze_endpoints",
+            return_value=[],
+        ), patch(
+            "app.main.GatewayBypass.analyze",
+            new_callable=AsyncMock,
+            return_value={
+                "status": "inconclusive",
+                "services": [],
+                "reason": "No service was found in the test.",
+            },
+        ):
+            response = self.client.get(
+                "/scan",
+                params={
+                    "target": SECONDARY_ORIGIN,
+                    "kiterunner_limit": 2,
+                    "wordlist_name": "routes.txt",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        discovery.assert_called_once_with(
+            SECONDARY_ORIGIN,
+            2,
+            wordlist=wordlist,
+        )
+        stages = {
+            event["stage"]: event
+            for event in response.json()["discovery_stages"]
+        }
+        self.assertEqual(stages["API Discovery"]["status"], "completed")
+
     def test_different_hostname_evidence_does_not_expand_target_scope(self):
         file_result = {
             "results": [
