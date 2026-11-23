@@ -178,7 +178,7 @@ class GatewayBypass:
         return probe_paths, identifier_endpoints
 
     @classmethod
-    def _discovery_inventory(cls, gateway_target, discoveries):
+    def _discovery_inventory(cls, gateway_target, discoveries, authorized_origins=None):
         gateway_origins = {}
         endpoints_by_gateway = {}
         skipped_endpoints = []
@@ -186,6 +186,17 @@ class GatewayBypass:
         if target_parts:
             gateway_origins[target_parts["identity"]] = target_parts
             endpoints_by_gateway[target_parts["identity"]] = []
+        authorized_identities = set()
+        for origin in authorized_origins or []:
+            if not isinstance(origin, str):
+                continue
+            parts = cls._origin_parts(origin)
+            if (
+                parts
+                and target_parts
+                and parts["hostname"] == target_parts["hostname"]
+            ):
+                authorized_identities.add(parts["identity"])
 
         for item in discoveries if isinstance(discoveries, list) else []:
             if not isinstance(item, dict):
@@ -220,15 +231,22 @@ class GatewayBypass:
                 continue
             if (
                 target_parts is None
-                or route_parts["identity"] != target_parts["identity"]
+                or (
+                    route_parts["identity"] != target_parts["identity"]
+                    and (
+                        route_parts["identity"] not in authorized_identities
+                        or not cls._is_loopback(target_parts["hostname"])
+                    )
+                )
             ):
                 skipped_endpoints.append(
                     {
                         "method": str(item.get("method") or "UNKNOWN").upper(),
                         "path": route_path,
                         "reason": (
-                            "Active Gateway and service checks are limited to "
-                            "the exact target origin."
+                            "Active Gateway and service checks require the exact "
+                            "target origin or an explicitly authorized origin on "
+                            "the same hostname."
                         ),
                     }
                 )
@@ -568,6 +586,7 @@ class GatewayBypass:
         port_start=None,
         port_end=None,
         progress_callback=None,
+        authorized_origins=None,
     ):
         try:
             gateway_origin = self._gateway_origin(gateway_target)
@@ -585,6 +604,7 @@ class GatewayBypass:
             self._discovery_inventory(
                 gateway_target,
                 discoveries,
+                authorized_origins=authorized_origins,
             )
         )
         candidate_port_range = self._candidate_port_range(
@@ -605,12 +625,8 @@ class GatewayBypass:
             key=lambda item: (item["host"], item["port"], item["origin"]),
         )
         excluded_service_origins = []
-        exact_origin_gateways = [
-            gateway
-            for gateway in gateway_origins.values()
-            if gateway["identity"] == gateway_origin["identity"]
-        ]
-        if not exact_origin_gateways:
+        eligible_gateway_origins = list(gateway_origins.values())
+        if not eligible_gateway_origins:
             return {
                 "status": "inconclusive",
                 "reason": "Discovery did not provide local Gateway origins to compare.",
@@ -626,7 +642,7 @@ class GatewayBypass:
             }
 
         endpoint_groups = {}
-        for gateway in exact_origin_gateways:
+        for gateway in eligible_gateway_origins:
             gateway_endpoints = endpoints_by_gateway.get(gateway["identity"], [])
             if not gateway_endpoints:
                 continue
@@ -725,7 +741,7 @@ class GatewayBypass:
 
         candidate_services = {}
         excluded_port_set = {
-            gateway["port"] for gateway in exact_origin_gateways
+            gateway["port"] for gateway in eligible_gateway_origins
         }
         ports_to_probe = [
             port for port in candidate_port_range if port not in excluded_port_set

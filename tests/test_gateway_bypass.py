@@ -132,6 +132,82 @@ class GatewayBypassTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["skipped_endpoints"]), 3)
         self.assertEqual(len(requests), 13)
 
+    async def test_authorized_same_host_api_origin_is_gateway_baseline(self):
+        requests = []
+
+        async def handler(request):
+            requests.append(request)
+            if request.url.port == 8085:
+                return httpx.Response(403, json={"error": "forbidden"})
+            return httpx.Response(200, json={"items": [{"id": 1}]})
+
+        async def port_probe(hostname, port):
+            return port == 8081
+
+        result = await GatewayBypass(
+            transport=httpx.MockTransport(handler),
+            port_probe=port_probe,
+        ).analyze(
+            "http://localhost:3000",
+            [
+                {
+                    "url": "http://localhost:8085/api/orders",
+                    "method": "GET",
+                }
+            ],
+            scan_mode="standard",
+            port_start=8081,
+            port_end=8085,
+            authorized_origins=[
+                "http://localhost:3000",
+                "http://localhost:8085",
+            ],
+        )
+
+        self.assertEqual(result["status"], "completed")
+        endpoint = result["services"][0]["endpoints"][0]
+        self.assertEqual(endpoint["gateway"]["request"]["url"], "http://localhost:8085/api/orders")
+        self.assertEqual(endpoint["direct"]["request"]["url"], "http://localhost:8081/api/orders")
+        self.assertEqual([request.url.port for request in requests], [8081, 8085, 8081])
+        self.assertEqual(
+            {origin["origin"] for origin in result["gateway_origins"]},
+            {"http://localhost:3000", "http://localhost:8085"},
+        )
+        self.assertIn(
+            {
+                "origin": "http://localhost:8085",
+                "port": 8085,
+                "reason": (
+                    "The port appears in the input URL or a discovered Gateway "
+                    "origin and is excluded from service candidates."
+                ),
+            },
+            result["excluded_service_origins"],
+        )
+
+    async def test_unauthorized_same_host_route_on_another_port_is_skipped(self):
+        async def port_probe(hostname, port):
+            self.fail("Port scan should not run when there are no eligible routes.")
+
+        result = await GatewayBypass(
+            port_probe=port_probe,
+        ).analyze(
+            "http://localhost:8085",
+            [
+                {
+                    "url": "http://localhost:8081/api/orders",
+                    "method": "GET",
+                }
+            ],
+            scan_mode="standard",
+            port_start=8081,
+            port_end=8081,
+        )
+
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertEqual(len(result["skipped_endpoints"]), 1)
+        self.assertIn("explicitly authorized origin", result["skipped_endpoints"][0]["reason"])
+
     async def test_full_scan_compares_all_discovered_routes_without_old_caps(self):
         requests = []
 
@@ -496,7 +572,7 @@ class GatewayBypassTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(requests, [])
 
-    async def test_other_port_origin_is_not_treated_as_the_exact_gateway(self):
+    async def test_unauthorized_other_port_does_not_replace_gateway_origin(self):
         requests = []
 
         async def handler(request):

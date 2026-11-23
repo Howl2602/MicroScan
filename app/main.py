@@ -2702,6 +2702,7 @@ async def _run_scan_pipeline(
                 port_start=gateway_bypass_port_start,
                 port_end=gateway_bypass_port_end,
                 progress_callback=emit,
+                authorized_origins=authorized_origins,
             )
         except ValueError as exc:
             gateway_bypass = {
