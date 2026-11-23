@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import unittest
@@ -460,16 +461,79 @@ class ScanPipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        discovery.assert_called_once_with(
-            SECONDARY_ORIGIN,
-            2,
-            wordlist=wordlist,
+        self.assertEqual(
+            discovery.call_args_list,
+            [
+                call(SECONDARY_ORIGIN, 2),
+                call(SECONDARY_ORIGIN, 2, wordlist=wordlist),
+            ],
         )
         stages = {
             event["stage"]: event
             for event in response.json()["discovery_stages"]
         }
         self.assertEqual(stages["API Discovery"]["status"], "completed")
+        self.assertEqual(stages["API Wordlist Discovery"]["status"], "completed")
+
+    def test_api_discovery_completes_while_file_discovery_is_still_running(self):
+        async def delayed_file_discovery(*_args, **kwargs):
+            await asyncio.sleep(0.05)
+            await kwargs["progress_callback"](
+                {
+                    "stage": "File Discovery",
+                    "status": "completed",
+                    "detail": "Collected 0 path and endpoint result(s).",
+                }
+            )
+            return {"results": [], "page_sources": [], "summary": {}}
+
+        with patch("app.main.Discovery.discover", return_value=[]), patch(
+            "app.main.FileDiscovery.scan",
+            new_callable=AsyncMock,
+            side_effect=delayed_file_discovery,
+        ), patch(
+            "app.main.Modules.analyze_endpoints",
+            return_value=[],
+        ), patch(
+            "app.main.GatewayBypass.analyze",
+            new_callable=AsyncMock,
+            return_value={
+                "status": "inconclusive",
+                "services": [],
+                "reason": "No service was found in the test.",
+            },
+        ):
+            response = self.client.get(
+                "/scan",
+                params={
+                    "target": SECONDARY_ORIGIN,
+                    "stream": "true",
+                    "jwt_testing": False,
+                    "bola_testing": False,
+                    "rate_limit_testing": False,
+                    "gateway_bypass_testing": False,
+                },
+            )
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        progress = [event for event in events if event["type"] == "progress"]
+        api_complete_index = next(
+            index
+            for index, event in enumerate(progress)
+            if event["stage"] == "API Discovery"
+            and event["status"] == "completed"
+        )
+        file_complete_index = next(
+            index
+            for index, event in enumerate(progress)
+            if event["stage"] == "File Discovery"
+            and event["status"] == "completed"
+        )
+        self.assertLess(api_complete_index, file_complete_index)
 
     def test_different_hostname_evidence_does_not_expand_target_scope(self):
         file_result = {

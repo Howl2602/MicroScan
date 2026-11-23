@@ -1672,58 +1672,104 @@ async def _run_scan_pipeline(
     )
 
     await emit("API Discovery", "running")
-    kiterunner_results = []
-    kiterunner_error = None
-
     await emit("File Discovery", "running")
-    file_result = {"results": [], "summary": {}}
-    file_error = None
-    try:
-        selected_wordlist = None
-        wordlist_truncated = False
-        if wordlist_name:
-            selected_wordlist, wordlist_truncated = load_wordlist_file(
-                wordlist_name, wordlist_limit
+
+    use_embedded_wordlist_for_input_origin = (
+        kiterunner_wordlist is not None
+        and Signin.is_loopback_target(discovery_target)
+    )
+
+    async def run_file_discovery():
+        file_result = {"results": [], "summary": {}}
+        file_error = None
+        try:
+            selected_wordlist = None
+            wordlist_truncated = False
+            if wordlist_name:
+                selected_wordlist, wordlist_truncated = load_wordlist_file(
+                    wordlist_name, wordlist_limit
+                )
+            file_result = await FileDiscovery().scan(
+                normalized_target,
+                wordlist=selected_wordlist,
+                verify_endpoints=bool(file_verification_target),
+                gateway_target=file_verification_target,
+                progress_callback=emit,
+                wordlist_limit=wordlist_limit,
             )
-        file_result = await FileDiscovery().scan(
-            normalized_target,
-            wordlist=selected_wordlist,
-            verify_endpoints=bool(file_verification_target),
-            gateway_target=file_verification_target,
-            progress_callback=emit,
-            wordlist_limit=wordlist_limit,
-        )
-        if wordlist_truncated:
-            file_result.setdefault("summary", {})["wordlist_truncated"] = True
-        if wordlist_name:
-            file_result.setdefault("summary", {})["wordlist_name"] = wordlist_name
-        request_count = file_result.get("summary", {}).get("requests_made", 0)
-        failed_count = file_result.get("summary", {}).get("requests_failed", 0)
-        if request_count and failed_count >= request_count:
-            file_error = "All File Discovery requests failed."
+            if wordlist_truncated:
+                file_result.setdefault("summary", {})["wordlist_truncated"] = True
+            if wordlist_name:
+                file_result.setdefault("summary", {})["wordlist_name"] = wordlist_name
+            request_count = file_result.get("summary", {}).get("requests_made", 0)
+            failed_count = file_result.get("summary", {}).get("requests_failed", 0)
+            if request_count and failed_count >= request_count:
+                file_error = "All File Discovery requests failed."
+                await emit("File Discovery", "error", file_error)
+        except (ValueError, httpx.HTTPError, TimeoutError, RuntimeError) as exc:
+            file_error = str(exc)
+            logger.warning("File Discovery failed | error=%s", type(exc).__name__)
             await emit("File Discovery", "error", file_error)
-        else:
-            file_error = None
-    except (ValueError, httpx.HTTPError, TimeoutError, RuntimeError) as exc:
-        file_error = str(exc)
-        logger.warning("File Discovery failed | error=%s", type(exc).__name__)
-        await emit("File Discovery", "error", file_error)
-        if "JavaScript Analysis" not in stages:
-            await emit(
-                "JavaScript Analysis",
-                "skipped",
-                "File Discovery could not retrieve an in-scope HTML document.",
-            )
-    except Exception as exc:
-        file_error = f"File Discovery failed with {type(exc).__name__}."
-        logger.exception("File Discovery failed | error=%s", type(exc).__name__)
-        await emit("File Discovery", "error", file_error)
-        if "JavaScript Analysis" not in stages:
-            await emit(
-                "JavaScript Analysis",
-                "skipped",
-                "File Discovery could not retrieve an in-scope HTML document.",
-            )
+            if "JavaScript Analysis" not in stages:
+                await emit(
+                    "JavaScript Analysis",
+                    "skipped",
+                    "File Discovery could not retrieve an in-scope HTML document.",
+                )
+        except Exception as exc:
+            file_error = f"File Discovery failed with {type(exc).__name__}."
+            logger.exception("File Discovery failed | error=%s", type(exc).__name__)
+            await emit("File Discovery", "error", file_error)
+            if "JavaScript Analysis" not in stages:
+                await emit(
+                    "JavaScript Analysis",
+                    "skipped",
+                    "File Discovery could not retrieve an in-scope HTML document.",
+                )
+        return file_result, file_error
+
+    async def run_input_api_discovery():
+        try:
+            if use_embedded_wordlist_for_input_origin or kiterunner_wordlist is None:
+                results = await asyncio.to_thread(
+                    Discovery().discover, discovery_target, num
+                )
+            else:
+                results = await asyncio.to_thread(
+                    Discovery().discover,
+                    discovery_target,
+                    num,
+                    wordlist=kiterunner_wordlist,
+                )
+            if use_embedded_wordlist_for_input_origin:
+                detail = (
+                    f"Kiterunner discovered {len(results)} endpoint(s) "
+                    "on the input origin using its built-in Assetnote routes; "
+                    "the selected wordlist will be used for discovered API origins."
+                )
+            elif kiterunner_wordlist is not None:
+                detail = (
+                    f"Kiterunner discovered {len(results)} endpoint(s) "
+                    f"using {wordlist_name} (up to {num} entries)."
+                )
+            else:
+                detail = f"Kiterunner discovered {len(results)} endpoint(s)."
+            await emit("API Discovery", "completed", detail)
+            return results, None
+        except (ValueError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
+            error = str(exc)
+            logger.warning("API Discovery failed | error=%s", type(exc).__name__)
+            await emit("API Discovery", "error", error)
+            return [], error
+        except Exception as exc:
+            error = f"Kiterunner failed with {type(exc).__name__}."
+            logger.exception("API Discovery failed | error=%s", type(exc).__name__)
+            await emit("API Discovery", "error", error)
+            return [], error
+
+    file_discovery_task = asyncio.create_task(run_file_discovery())
+    kiterunner_results, kiterunner_error = await run_input_api_discovery()
+    file_result, file_error = await file_discovery_task
 
     same_host_origins = sorted(
         _discovered_same_host_origins(file_result, normalized_target)
@@ -1748,45 +1794,41 @@ async def _run_scan_pipeline(
     )
     base_origin = _normalized_scope_origin(discovery_target)
     alternate_origins = sorted(discovered_origins - {base_origin})
-    use_embedded_wordlist_for_input_origin = (
-        kiterunner_wordlist is not None
-        and Signin.is_loopback_target(discovery_target)
-        and alternate_origins
-    )
-    try:
-        if use_embedded_wordlist_for_input_origin or kiterunner_wordlist is None:
-            kiterunner_results = await asyncio.to_thread(
-                Discovery().discover, discovery_target, num
-            )
-        else:
-            kiterunner_results = await asyncio.to_thread(
+    if (
+        use_embedded_wordlist_for_input_origin
+        and kiterunner_wordlist is not None
+        and not alternate_origins
+        and not file_result.get("page_sources")
+    ):
+        await emit(
+            "API Wordlist Discovery",
+            "running",
+            "Scanning the input origin with the selected wordlist.",
+        )
+        try:
+            wordlist_results = await asyncio.to_thread(
                 Discovery().discover,
                 discovery_target,
                 num,
                 wordlist=kiterunner_wordlist,
             )
-        if use_embedded_wordlist_for_input_origin:
-            detail = (
-                f"Kiterunner discovered {len(kiterunner_results)} endpoint(s) "
-                "on the input origin using its built-in Assetnote routes; "
-                "the selected wordlist will be used for discovered API origins."
+            kiterunner_results.extend(wordlist_results)
+            await emit(
+                "API Wordlist Discovery",
+                "completed",
+                (
+                    f"Kiterunner discovered {len(wordlist_results)} endpoint(s) "
+                    f"using {wordlist_name} (up to {num} entries)."
+                ),
             )
-        elif kiterunner_wordlist is not None:
-            detail = (
-                f"Kiterunner discovered {len(kiterunner_results)} endpoint(s) "
-                f"using {wordlist_name} (up to {num} entries)."
-            )
-        else:
-            detail = f"Kiterunner discovered {len(kiterunner_results)} endpoint(s)."
-        await emit("API Discovery", "completed", detail)
-    except (ValueError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
-        kiterunner_error = str(exc)
-        logger.warning("API Discovery failed | error=%s", type(exc).__name__)
-        await emit("API Discovery", "error", kiterunner_error)
-    except Exception as exc:
-        kiterunner_error = f"Kiterunner failed with {type(exc).__name__}."
-        logger.exception("API Discovery failed | error=%s", type(exc).__name__)
-        await emit("API Discovery", "error", kiterunner_error)
+        except (ValueError, FileNotFoundError, RuntimeError, TimeoutError) as exc:
+            error = str(exc)
+            logger.warning("API Wordlist Discovery failed | error=%s", type(exc).__name__)
+            await emit("API Wordlist Discovery", "error", error)
+        except Exception as exc:
+            error = f"Kiterunner failed with {type(exc).__name__}."
+            logger.exception("API Wordlist Discovery failed | error=%s", type(exc).__name__)
+            await emit("API Wordlist Discovery", "error", error)
 
     for endpoint in kiterunner_results:
         if not isinstance(endpoint, dict) or endpoint.get("resolved_url"):
